@@ -132,6 +132,8 @@ Available variables for all notifications:
 3. **API Issues**
    - Verify API credentials
    - Check WATI template names
+   - Check if the phone number is correct
+   - Check the templates variables names
    - Monitor API response logs
 
 ## Support
