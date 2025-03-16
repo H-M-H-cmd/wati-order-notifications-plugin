@@ -6,12 +6,12 @@ A WordPress plugin that integrates WooCommerce with WATI (WhatsApp API) to send 
 
 - WordPress
 - WooCommerce
-- CartFlows Pro (for abandoned cart functionality)
+- WooCommerce Cart Abandonment Recovery Pro (for abandoned cart functionality)
 - WATI Business Account
 
 ## Features
 
-### Abandoned Cart Recovery (Requires CartFlows Pro)
+### Abandoned Cart Recovery (Requires WooCommerce Cart Abandonment Recovery Pro)
 - Send WhatsApp notifications for abandoned carts
 - Configurable delay time (e.g., 48 hours after abandonment)
 - Follow-up discount reminders for unclaimed carts
@@ -38,7 +38,7 @@ A WordPress plugin that integrates WooCommerce with WATI (WhatsApp API) to send 
 ## Installation
 
 1. Install and activate WooCommerce
-2. Install and activate CartFlows Pro (required for abandoned cart features)
+2. Install and activate WooCommerce Cart Abandonment Recovery Pro (required for abandoned cart features)
 3. Upload the plugin to WordPress
 4. Activate the plugin
 5. Configure WATI API settings
@@ -58,13 +58,13 @@ A WordPress plugin that integrates WooCommerce with WATI (WhatsApp API) to send 
 
 ### 3. Notification Types
 
-#### Abandoned Cart (Requires CartFlows Pro)
+#### Abandoned Cart (Requires WooCommerce Cart Abandonment Recovery Pro)
 - Enable notifications
 - Set template name
 - Configure delay time
 - Add template variables
 
-#### Discount Reminder (Requires CartFlows Pro)
+#### Discount Reminder (Requires WooCommerce Cart Abandonment Recovery Pro)
 - Secondary notification for abandoned carts
 - Longer delay time (e.g., 72 hours)
 - Different template for discount offers
@@ -120,7 +120,7 @@ Available variables for all notifications:
 ### Common Issues
 
 1. **Abandoned Cart Notifications Not Working**
-   - Verify CartFlows Pro is active
+   - Verify WooCommerce Cart Abandonment Recovery Pro is active
    - Check abandoned cart data exists
    - Verify phone numbers are collected
 
