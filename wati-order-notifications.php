@@ -21,6 +21,9 @@ add_action('wp_ajax_search_users', 'wati_search_users_ajax');
 add_action('wp_ajax_fetch_wati_templates', 'fetch_wati_templates_ajax');
 add_action('wp_ajax_test_abandoned_check', 'test_abandoned_check');
 
+// Track order status changes
+add_action('woocommerce_order_status_changed', 'wati_track_order_status_change', 10, 4);
+
 // Add settings page
 function wati_notifications_settings_page() {
     add_menu_page(
@@ -1174,16 +1177,15 @@ function check_shipped_orders($settings, $is_test = false) {
 
     // Get shipped and completed orders
     $args = array(
-        'status' => array('completed', 'shipped'),  // Check both statuses
+        'status' => array('completed', 'shipped'),
         'limit' => -1,
-        'date_modified' => '>' . date('Y-m-d H:i:s', strtotime("-{$delay_minutes} minutes")),
         'return' => 'ids'
     );
     
     $order_ids = wc_get_orders($args);
     $details['total_orders'] = count($order_ids);
 
-    error_log('WATI Debug: Found ' . count($order_ids) . ' recently shipped/completed orders');
+    error_log('WATI Debug: Found ' . count($order_ids) . ' shipped/completed orders');
 
     // Add user filter
     if (!empty($settings['specific_users'])) {
@@ -1204,16 +1206,15 @@ function check_shipped_orders($settings, $is_test = false) {
         // Get the status change time
         $status_changed = $order->get_date_modified()->getTimestamp();
         $time_diff = time() - $status_changed;
-
-        error_log("WATI Debug: Order {$order_id} status: " . $order->get_status() . ", changed: " . $order->get_date_modified()->format('Y-m-d H:i:s'));
-
-        // Skip if not enough time has passed since status change
-        if ($time_diff < ($delay_minutes * 60) && !$is_test) {
-            error_log("WATI Debug: Order {$order_id} status changed too recently, waiting for delay time");
-            continue;
-        }
-
         $notification_key = 'wati_shipped_' . $order_id;
+
+        error_log("WATI Debug: Processing order {$order_id}");
+        error_log("WATI Debug: Status: " . $order->get_status());
+        error_log("WATI Debug: Modified: " . $order->get_date_modified()->format('Y-m-d H:i:s'));
+        error_log("WATI Debug: Time diff: {$time_diff} seconds");
+        error_log("WATI Debug: Required delay: " . ($delay_minutes * 60) . " seconds");
+        error_log("WATI Debug: Notification sent before: " . (get_option($notification_key) ? 'Yes' : 'No'));
+
         $order_info = array(
             'id' => $order_id,
             'date' => $order->get_date_created()->format('Y-m-d H:i:s'),
@@ -1225,31 +1226,33 @@ function check_shipped_orders($settings, $is_test = false) {
             'status' => $order->get_status()
         );
 
+        // Skip if notification already sent
         if (get_option($notification_key)) {
+            error_log("WATI Debug: Order {$order_id} already notified");
             $order_info['status'] = 'already_notified';
             $details['already_notified']++;
             continue;
         }
 
-        if (empty($order->get_billing_phone())) {
-            $order_info['status'] = 'no_phone';
-            $details['no_phone']++;
+        // Skip if not enough time has passed (unless testing)
+        if ($time_diff < ($delay_minutes * 60) && !$is_test) {
+            error_log("WATI Debug: Order {$order_id} not ready for notification yet");
             continue;
         }
 
-        // Add user filter check
-        if (!empty($settings['specific_users']) && !in_array($order->get_customer_id(), $settings['specific_users'])) {
+        if (empty($order->get_billing_phone())) {
+            error_log("WATI Debug: Order {$order_id} has no phone number");
+            $order_info['status'] = 'no_phone';
+            $details['no_phone']++;
             continue;
         }
 
         $order_info['status'] = 'eligible';
         $details['eligible_orders']++;
         
-        error_log("WATI Debug: Processing shipped notification for order {$order_id}");
-        
         if (!$is_test) {
             // Add random delay before sending if not the first message
-            if ($details['eligible_orders'] > 0) {
+            if ($details['eligible_orders'] > 1) {
                 wati_random_delay();
             }
 
@@ -1271,31 +1274,16 @@ function check_shipped_orders($settings, $is_test = false) {
                 }
             }
 
-            error_log("WATI Debug: Sending shipped notification for order {$order_id} to " . $order->get_billing_phone());
+            error_log("WATI Debug: Attempting to send notification for order {$order_id}");
+            error_log("WATI Debug: Template: " . $settings['conditions']['shipped']['template_name']);
+            error_log("WATI Debug: Variables: " . print_r($variables, true));
 
             if (send_wati_template($order->get_billing_phone(), $settings['conditions']['shipped']['template_name'], $variables)) {
                 update_option($notification_key, current_time('mysql'), false);
                 $order_info['notification_sent'] = true;
-                
-                error_log("WATI Debug: Successfully sent shipped notification for order {$order_id}");
-                
-                // Log success
-                wati_log_notification('shipped', $order->get_billing_phone(), $settings['conditions']['shipped']['template_name'], 'success', array(
-                    'order_id' => $order_id,
-                    'customer_id' => $order->get_customer_id(),
-                    'variables' => $variables,
-                    'status_changed' => $order->get_date_modified()->format('Y-m-d H:i:s')
-                ));
+                error_log("WATI Debug: Successfully sent notification for order {$order_id}");
             } else {
-                error_log("WATI Debug: Failed to send shipped notification for order {$order_id}");
-                
-                // Log failure
-                wati_log_notification('shipped', $order->get_billing_phone(), $settings['conditions']['shipped']['template_name'], 'error', array(
-                    'order_id' => $order_id,
-                    'customer_id' => $order->get_customer_id(),
-                    'error' => 'Failed to send shipped notification',
-                    'status_changed' => $order->get_date_modified()->format('Y-m-d H:i:s')
-                ));
+                error_log("WATI Debug: Failed to send notification for order {$order_id}");
             }
         }
 
@@ -1854,4 +1842,21 @@ function wati_add_shipped_to_order_statuses($order_statuses) {
     }
     return $new_order_statuses;
 }
-add_filter('wc_order_statuses', 'wati_add_shipped_to_order_statuses'); 
+add_filter('wc_order_statuses', 'wati_add_shipped_to_order_statuses');
+
+// Track order status changes
+function wati_track_order_status_change($order_id, $old_status, $new_status, $order) {
+    error_log("WATI Debug: Order status changed - Order: {$order_id}");
+    error_log("WATI Debug: Old status: {$old_status}");
+    error_log("WATI Debug: New status: {$new_status}");
+    
+    // If the new status is completed or shipped, force a check
+    if (in_array($new_status, array('completed', 'shipped'))) {
+        error_log("WATI Debug: Triggering immediate check for order {$order_id}");
+        
+        $settings = get_option('wati_notifications_settings', array());
+        if (!empty($settings['conditions']['shipped']['enabled'])) {
+            check_shipped_orders($settings);
+        }
+    }
+} 
