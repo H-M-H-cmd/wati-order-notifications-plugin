@@ -74,7 +74,7 @@ function wati_notifications_settings_page_html() {
         );
 
         // Save conditions
-        foreach (['abandoned', 'discount', 'processing', 'shipped'] as $status) {
+        foreach (['abandoned', 'discount', 'processing', 'shipped', 'tracking', 'custom'] as $status) {
             if (isset($_POST["wati_{$status}_enabled"])) {
                 $settings['conditions'][$status] = array(
                     'enabled' => 1,
@@ -255,6 +255,14 @@ function wati_notifications_settings_page_html() {
                     'shipped' => array(
                         'label' => 'Completed/Shipped Order',
                         'description' => 'Send notification when order status changes to "Completed" (typically used for shipped orders)'
+                    ),
+                    'tracking' => array(
+                        'label' => 'Tracking Updates',
+                        'description' => 'Send tracking information updates independently (useful for sending tracking details separately)'
+                    ),
+                    'custom' => array(
+                        'label' => 'Custom Template',
+                        'description' => 'Custom template for additional notifications with all available variables'
                     )
                 );
 
@@ -547,7 +555,9 @@ function wati_render_user_tag($user) {
 function wati_render_variable_row($status, $var = array()) {
     $types = array(
         'customer_name' => 'Customer Name',
-        'order_number' => 'Order Number'
+        'order_number' => 'Order Number',
+        'tracking_number' => 'SMSA Tracking Number',
+        'tracking_url' => 'SMSA Tracking URL'
     );
 
     $html = '<div class="variable-row">';
@@ -942,6 +952,14 @@ function wati_check_notifications() {
         error_log('WATI Debug: Discount reminders are disabled');
     }
 
+    // Check custom template notifications
+    if (!empty($settings['conditions']['custom']['enabled'])) {
+        error_log('WATI Debug: Checking custom template notifications...');
+        check_custom_notifications($settings);
+    } else {
+        error_log('WATI Debug: Custom template notifications are disabled');
+    }
+
     // Log completion
     wati_log_notification('cron', '', '', 'info', array(
         'message' => 'Cron job completed',
@@ -949,7 +967,8 @@ function wati_check_notifications() {
             'abandoned' => !empty($settings['conditions']['abandoned']['enabled']),
             'processing' => !empty($settings['conditions']['processing']['enabled']),
             'shipped' => !empty($settings['conditions']['shipped']['enabled']),
-            'discount' => !empty($settings['conditions']['discount']['enabled'])
+            'discount' => !empty($settings['conditions']['discount']['enabled']),
+            'custom' => !empty($settings['conditions']['custom']['enabled'])
         )
     ));
 
@@ -1141,6 +1160,25 @@ function check_processing_orders($settings, $is_test = false) {
                             'value' => $order_id
                         );
                         break;
+                    case 'tracking_number':
+                        $tracking_number = get_post_meta($order_id, 'smsa_awb_no', true);
+                        if (!empty($tracking_number)) {
+                            $variables[] = array(
+                                'name' => $var['template_name'],
+                                'value' => $tracking_number
+                            );
+                        }
+                        break;
+                    case 'tracking_url':
+                        $tracking_number = get_post_meta($order_id, 'smsa_awb_no', true);
+                        if (!empty($tracking_number)) {
+                            $tracking_url = "https://www.smsaexpress.com/sa/ar/trackingdetails?tracknumbers=" . $tracking_number;
+                            $variables[] = array(
+                                'name' => $var['template_name'],
+                                'value' => $tracking_url
+                            );
+                        }
+                        break;
                 }
             }
 
@@ -1271,6 +1309,25 @@ function check_shipped_orders($settings, $is_test = false) {
                             'value' => $order_id
                         );
                         break;
+                    case 'tracking_number':
+                        $tracking_number = get_post_meta($order_id, 'smsa_awb_no', true);
+                        if (!empty($tracking_number)) {
+                            $variables[] = array(
+                                'name' => $var['template_name'],
+                                'value' => $tracking_number
+                            );
+                        }
+                        break;
+                    case 'tracking_url':
+                        $tracking_number = get_post_meta($order_id, 'smsa_awb_no', true);
+                        if (!empty($tracking_number)) {
+                            $tracking_url = "https://www.smsaexpress.com/sa/ar/trackingdetails?tracknumbers=" . $tracking_number;
+                            $variables[] = array(
+                                'name' => $var['template_name'],
+                                'value' => $tracking_url
+                            );
+                        }
+                        break;
                 }
             }
 
@@ -1327,9 +1384,15 @@ function wati_notification_logs_page_html() {
                 <select id="log-type-filter">
                     <option value="">All Types</option>
                     <option value="cron">Cron Jobs</option>
+                    <option value="notification">Notifications</option>
+                    <option value="error">Errors</option>
+                    <option value="test">Test Results</option>
                     <option value="abandoned">Abandoned Cart</option>
                     <option value="processing">Processing Order</option>
                     <option value="shipped">Shipped Order</option>
+                    <option value="tracking">Tracking</option>
+                    <option value="discount">Discount</option>
+                    <option value="custom">Custom</option>
                 </select>
             </div>
         </div>
@@ -1352,7 +1415,7 @@ function wati_notification_logs_page_html() {
                     </tr>
                 <?php else: ?>
                     <?php foreach (array_reverse($logs) as $log): ?>
-                        <tr class="log-entry <?php echo esc_attr($log['type']); ?>">
+                        <tr class="log-entry" data-type="<?php echo esc_attr($log['type']); ?>">
                             <td><?php echo esc_html($log['time']); ?></td>
                             <td><?php echo esc_html(ucfirst($log['type'])); ?></td>
                             <td><?php echo esc_html($log['phone']); ?></td>
@@ -1409,10 +1472,10 @@ function wati_notification_logs_page_html() {
     jQuery(document).ready(function($) {
         // Filter logs by type
         $('#log-type-filter').on('change', function() {
-            var type = $(this).val();
-            if (type) {
+            var selectedType = $(this).val();
+            if (selectedType) {
                 $('.log-entry').hide();
-                $('.log-entry.' + type).show();
+                $('.log-entry[data-type="' + selectedType + '"]').show();
             } else {
                 $('.log-entry').show();
             }
@@ -1771,6 +1834,26 @@ function check_discount_notifications($settings, $is_test = false) {
                         'value' => $cart->id
                     );
                     break;
+                case 'tracking_number':
+                    $tracking_number = get_post_meta($cart->id, 'smsa_awb_no', true);
+                    if (!empty($tracking_number)) {
+                        $variables[] = array(
+                            'name' => $var['template_name'],
+                            'value' => $tracking_number
+                        );
+                    }
+                    break;
+                case 'tracking_url':
+                    $tracking_number = get_post_meta($cart->id, 'smsa_awb_no', true);
+                    if (!empty($tracking_number)) {
+                        $tracking_url = "https://www.smsaexpress.com/sa/ar/trackingdetails?tracknumbers=" . $tracking_number;
+                        $variables[] = array(
+                            'name' => $var['template_name'],
+                            'value' => $tracking_url
+                        );
+                    }
+                    break;
+                    
             }
         }
 
@@ -1859,4 +1942,293 @@ function wati_track_order_status_change($order_id, $old_status, $new_status, $or
             check_shipped_orders($settings);
         }
     }
+}
+
+// Check custom template notifications
+function check_custom_notifications($settings, $is_test = false) {
+    global $wpdb;
+    
+    $details = array(
+        'condition' => $settings['conditions']['custom'],
+        'found_orders' => array(),
+        'total_orders' => 0,
+        'eligible_orders' => 0,
+        'already_notified' => 0,
+        'no_phone' => 0
+    );
+
+    // Get the delay time
+    $condition = $settings['conditions']['custom'];
+    $delay_minutes = $condition['delay_unit'] === 'hours' ? 
+        $condition['delay_time'] * 60 : 
+        $condition['delay_time'];
+
+    // Get all orders
+    $args = array(
+        'status' => array('any'),
+        'limit' => -1,
+        'return' => 'ids'
+    );
+    
+    $order_ids = wc_get_orders($args);
+    $details['total_orders'] = count($order_ids);
+
+    error_log('WATI Debug: Found ' . count($order_ids) . ' orders for custom template');
+
+    // Add user filter
+    if (!empty($settings['specific_users'])) {
+        $filtered_order_ids = array();
+        foreach ($order_ids as $order_id) {
+            $order = wc_get_order($order_id);
+            if ($order && in_array($order->get_customer_id(), $settings['specific_users'])) {
+                $filtered_order_ids[] = $order_id;
+            }
+        }
+        $order_ids = $filtered_order_ids;
+    }
+
+    foreach ($order_ids as $order_id) {
+        $order = wc_get_order($order_id);
+        if (!$order) continue;
+
+        $notification_key = 'wati_custom_' . $order_id;
+
+        error_log("WATI Debug: Processing order {$order_id} for custom template");
+
+        $order_info = array(
+            'id' => $order_id,
+            'date' => $order->get_date_created()->format('Y-m-d H:i:s'),
+            'total' => $order->get_total(),
+            'customer' => $order->get_billing_first_name() . ' ' . $order->get_billing_last_name(),
+            'phone' => $order->get_billing_phone(),
+            'customer_id' => $order->get_customer_id(),
+            'status' => $order->get_status()
+        );
+
+        // Skip if notification already sent
+        if (get_option($notification_key)) {
+            error_log("WATI Debug: Order {$order_id} already notified for custom template");
+            $order_info['status'] = 'already_notified';
+            $details['already_notified']++;
+            continue;
+        }
+
+        if (empty($order->get_billing_phone())) {
+            error_log("WATI Debug: Order {$order_id} has no phone number");
+            $order_info['status'] = 'no_phone';
+            $details['no_phone']++;
+            continue;
+        }
+
+        $order_info['status'] = 'eligible';
+        $details['eligible_orders']++;
+        
+        if (!$is_test) {
+            // Add random delay before sending if not the first message
+            if ($details['eligible_orders'] > 1) {
+                wati_random_delay();
+            }
+
+            $variables = array();
+            foreach ($settings['conditions']['custom']['variables'] as $var) {
+                switch ($var['type']) {
+                    case 'customer_name':
+                        $variables[] = array(
+                            'name' => $var['template_name'],
+                            'value' => $order->get_billing_first_name()
+                        );
+                        break;
+                    case 'order_number':
+                        $variables[] = array(
+                            'name' => $var['template_name'],
+                            'value' => $order_id
+                        );
+                        break;
+                    case 'tracking_number':
+                        $tracking_number = get_post_meta($order_id, 'smsa_awb_no', true);
+                        if (!empty($tracking_number)) {
+                            $variables[] = array(
+                                'name' => $var['template_name'],
+                                'value' => $tracking_number
+                            );
+                        }
+                        break;
+                    case 'tracking_url':
+                        $tracking_number = get_post_meta($order_id, 'smsa_awb_no', true);
+                        if (!empty($tracking_number)) {
+                            $tracking_url = "https://www.smsaexpress.com/sa/ar/trackingdetails?tracknumbers=" . $tracking_number;
+                            $variables[] = array(
+                                'name' => $var['template_name'],
+                                'value' => $tracking_url
+                            );
+                        }
+                        break;
+                }
+            }
+
+            error_log("WATI Debug: Attempting to send custom notification for order {$order_id}");
+            error_log("WATI Debug: Template: " . $settings['conditions']['custom']['template_name']);
+            error_log("WATI Debug: Variables: " . print_r($variables, true));
+
+            if (send_wati_template($order->get_billing_phone(), $settings['conditions']['custom']['template_name'], $variables)) {
+                update_option($notification_key, current_time('mysql'), false);
+                $order_info['notification_sent'] = true;
+                error_log("WATI Debug: Successfully sent custom notification for order {$order_id}");
+            } else {
+                error_log("WATI Debug: Failed to send custom notification for order {$order_id}");
+            }
+        }
+
+        $details['found_orders'][] = $order_info;
+    }
+
+    return $details;
 } 
+
+// Check tracking notifications
+function check_tracking_notifications($settings, $is_test = false) {
+    global $wpdb;
+    
+    $details = array(
+        'condition' => $settings['conditions']['tracking'],
+        'found_orders' => array(),
+        'total_orders' => 0,
+        'eligible_orders' => 0,
+        'already_notified' => 0,
+        'no_phone' => 0
+    );
+
+    // Get the delay time
+    $condition = $settings['conditions']['tracking'];
+    $delay_minutes = $condition['delay_unit'] === 'hours' ? 
+        $condition['delay_time'] * 60 : 
+        $condition['delay_time'];
+
+    // Get orders with tracking numbers
+    $args = array(
+        'status' => array('any'),
+        'limit' => -1,
+        'return' => 'ids',
+        'meta_query' => array(
+            array(
+                'key' => 'smsa_awb_no',
+                'compare' => 'EXISTS'
+            )
+        )
+    );
+    
+    $order_ids = wc_get_orders($args);
+    $details['total_orders'] = count($order_ids);
+
+    error_log('WATI Debug: Found ' . count($order_ids) . ' orders with tracking numbers');
+
+    // Add user filter
+    if (!empty($settings['specific_users'])) {
+        $filtered_order_ids = array();
+        foreach ($order_ids as $order_id) {
+            $order = wc_get_order($order_id);
+            if ($order && in_array($order->get_customer_id(), $settings['specific_users'])) {
+                $filtered_order_ids[] = $order_id;
+            }
+        }
+        $order_ids = $filtered_order_ids;
+    }
+
+    foreach ($order_ids as $order_id) {
+        $order = wc_get_order($order_id);
+        if (!$order) continue;
+
+        $notification_key = 'wati_tracking_' . $order_id;
+        $tracking_number = get_post_meta($order_id, 'smsa_awb_no', true);
+
+        error_log("WATI Debug: Processing order {$order_id} for tracking template");
+        error_log("WATI Debug: Tracking number: {$tracking_number}");
+
+        $order_info = array(
+            'id' => $order_id,
+            'date' => $order->get_date_created()->format('Y-m-d H:i:s'),
+            'total' => $order->get_total(),
+            'customer' => $order->get_billing_first_name() . ' ' . $order->get_billing_last_name(),
+            'phone' => $order->get_billing_phone(),
+            'customer_id' => $order->get_customer_id(),
+            'status' => $order->get_status(),
+            'tracking_number' => $tracking_number
+        );
+
+        // Skip if notification already sent
+        if (get_option($notification_key)) {
+            error_log("WATI Debug: Order {$order_id} already notified for tracking");
+            $order_info['status'] = 'already_notified';
+            $details['already_notified']++;
+            continue;
+        }
+
+        if (empty($order->get_billing_phone())) {
+            error_log("WATI Debug: Order {$order_id} has no phone number");
+            $order_info['status'] = 'no_phone';
+            $details['no_phone']++;
+            continue;
+        }
+
+        $order_info['status'] = 'eligible';
+        $details['eligible_orders']++;
+        
+        if (!$is_test) {
+            // Add random delay before sending if not the first message
+            if ($details['eligible_orders'] > 1) {
+                wati_random_delay();
+            }
+
+            $variables = array();
+            foreach ($settings['conditions']['tracking']['variables'] as $var) {
+                switch ($var['type']) {
+                    case 'customer_name':
+                        $variables[] = array(
+                            'name' => $var['template_name'],
+                            'value' => $order->get_billing_first_name()
+                        );
+                        break;
+                    case 'order_number':
+                        $variables[] = array(
+                            'name' => $var['template_name'],
+                            'value' => $order_id
+                        );
+                        break;
+                    case 'tracking_number':
+                        if (!empty($tracking_number)) {
+                            $variables[] = array(
+                                'name' => $var['template_name'],
+                                'value' => $tracking_number
+                            );
+                        }
+                        break;
+                    case 'tracking_url':
+                        if (!empty($tracking_number)) {
+                            $tracking_url = "https://www.smsaexpress.com/sa/ar/trackingdetails?tracknumbers=" . $tracking_number;
+                            $variables[] = array(
+                                'name' => $var['template_name'],
+                                'value' => $tracking_url
+                            );
+                        }
+                        break;
+                }
+            }
+
+            error_log("WATI Debug: Attempting to send tracking notification for order {$order_id}");
+            error_log("WATI Debug: Template: " . $settings['conditions']['tracking']['template_name']);
+            error_log("WATI Debug: Variables: " . print_r($variables, true));
+
+            if (send_wati_template($order->get_billing_phone(), $settings['conditions']['tracking']['template_name'], $variables)) {
+                update_option($notification_key, current_time('mysql'), false);
+                $order_info['notification_sent'] = true;
+                error_log("WATI Debug: Successfully sent tracking notification for order {$order_id}");
+            } else {
+                error_log("WATI Debug: Failed to send tracking notification for order {$order_id}");
+            }
+        }
+
+        $details['found_orders'][] = $order_info;
+    }
+
+    return $details;
+}
