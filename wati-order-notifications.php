@@ -2,7 +2,7 @@
 /*
 Plugin Name: WATI Order Notifications
 Description: Sends WhatsApp notifications for different order statuses using WATI API
-Version: 1.5
+Version: 1.2.0
 Author: Hamdy Mohammed
 */
 
@@ -74,7 +74,7 @@ function wati_notifications_settings_page_html() {
         );
 
         // Save conditions
-        foreach (['abandoned', 'discount', 'processing', 'shipped', 'tracking', 'custom'] as $status) {
+        foreach (['abandoned', 'discount', 'processing', 'shipped', 'tracking'] as $status) {
             if (isset($_POST["wati_{$status}_enabled"])) {
                 $settings['conditions'][$status] = array(
                     'enabled' => 1,
@@ -258,11 +258,7 @@ function wati_notifications_settings_page_html() {
                     ),
                     'tracking' => array(
                         'label' => 'Tracking Updates',
-                        'description' => 'Send tracking information updates independently (useful for sending tracking details separately)'
-                    ),
-                    'custom' => array(
-                        'label' => 'Custom Template',
-                        'description' => 'Custom template for additional notifications with all available variables'
+                        'description' => 'Send tracking information updates when tracking number becomes available'
                     )
                 );
 
@@ -910,6 +906,8 @@ function wati_check_notifications() {
     global $wpdb;
     $settings = get_option('wati_notifications_settings', array());
     
+    error_log('WATI Debug: Retrieved settings: ' . print_r($settings, true));
+    
     if (empty($settings['enable_feature'])) {
         error_log('WATI Debug: Feature is disabled in settings');
         wati_log_notification('cron', '', '', 'warning', array(
@@ -918,59 +916,52 @@ function wati_check_notifications() {
         return;
     }
 
-    error_log('WATI Debug: Settings loaded: ' . print_r($settings, true));
+    // Check tracking notifications first since it's independent of order status
+    if (!empty($settings['conditions']['tracking']['enabled'])) {
+        error_log('WATI Debug: Starting tracking notifications check from cron...');
+        try {
+            $tracking_results = check_tracking_notifications($settings);
+            error_log('WATI Debug: Tracking check completed. Results: ' . print_r($tracking_results, true));
+            
+            // Log the tracking check results
+            wati_log_notification('cron', '', '', 'info', array(
+                'message' => 'Tracking notifications check completed',
+                'tracking_results' => $tracking_results
+            ));
+        } catch (Exception $e) {
+            error_log('WATI Debug: Error in tracking notifications: ' . $e->getMessage());
+            wati_log_notification('error', '', '', 'error', array(
+                'message' => 'Error in tracking notifications',
+                'error' => $e->getMessage()
+            ));
+        }
+    } else {
+        error_log('WATI Debug: Tracking notifications are disabled');
+    }
 
     // Check abandoned carts
     if (!empty($settings['conditions']['abandoned']['enabled'])) {
         error_log('WATI Debug: Checking abandoned carts...');
         check_abandoned_carts($settings);
-    } else {
-        error_log('WATI Debug: Abandoned cart notifications are disabled');
     }
 
     // Check processing orders
     if (!empty($settings['conditions']['processing']['enabled'])) {
         error_log('WATI Debug: Checking processing orders...');
         check_processing_orders($settings);
-    } else {
-        error_log('WATI Debug: Processing order notifications are disabled');
     }
 
     // Check shipped orders
     if (!empty($settings['conditions']['shipped']['enabled'])) {
         error_log('WATI Debug: Checking completed/shipped orders...');
         check_shipped_orders($settings);
-    } else {
-        error_log('WATI Debug: Completed/shipped order notifications are disabled');
     }
 
     // Check discount reminders
     if (!empty($settings['conditions']['discount']['enabled'])) {
         error_log('WATI Debug: Checking discount reminders...');
         check_discount_notifications($settings);
-    } else {
-        error_log('WATI Debug: Discount reminders are disabled');
     }
-
-    // Check custom template notifications
-    if (!empty($settings['conditions']['custom']['enabled'])) {
-        error_log('WATI Debug: Checking custom template notifications...');
-        check_custom_notifications($settings);
-    } else {
-        error_log('WATI Debug: Custom template notifications are disabled');
-    }
-
-    // Log completion
-    wati_log_notification('cron', '', '', 'info', array(
-        'message' => 'Cron job completed',
-        'checks_performed' => array(
-            'abandoned' => !empty($settings['conditions']['abandoned']['enabled']),
-            'processing' => !empty($settings['conditions']['processing']['enabled']),
-            'shipped' => !empty($settings['conditions']['shipped']['enabled']),
-            'discount' => !empty($settings['conditions']['discount']['enabled']),
-            'custom' => !empty($settings['conditions']['custom']['enabled'])
-        )
-    ));
 
     error_log('WATI Debug: Scheduled check completed at ' . current_time('mysql'));
 }
@@ -1217,7 +1208,8 @@ function check_shipped_orders($settings, $is_test = false) {
     $args = array(
         'status' => array('completed', 'shipped'),
         'limit' => -1,
-        'return' => 'ids'
+        'return' => 'ids',
+        'type' => 'shop_order' // Only get regular orders, not refunds
     );
     
     $order_ids = wc_get_orders($args);
@@ -1229,122 +1221,135 @@ function check_shipped_orders($settings, $is_test = false) {
     if (!empty($settings['specific_users'])) {
         $filtered_order_ids = array();
         foreach ($order_ids as $order_id) {
-            $order = wc_get_order($order_id);
-            if ($order && in_array($order->get_customer_id(), $settings['specific_users'])) {
-                $filtered_order_ids[] = $order_id;
+            try {
+                $order = wc_get_order($order_id);
+                if ($order && !$order->get_type() !== 'shop_order_refund' && in_array($order->get_customer_id(), $settings['specific_users'])) {
+                    $filtered_order_ids[] = $order_id;
+                }
+            } catch (Exception $e) {
+                error_log('WATI Debug: Error processing order ' . $order_id . ': ' . $e->getMessage());
+                continue;
             }
         }
         $order_ids = $filtered_order_ids;
     }
 
     foreach ($order_ids as $order_id) {
-        $order = wc_get_order($order_id);
-        if (!$order) continue;
-
-        // Get the status change time
-        $status_changed = $order->get_date_modified()->getTimestamp();
-        $time_diff = time() - $status_changed;
-        $notification_key = 'wati_shipped_' . $order_id;
-
-        error_log("WATI Debug: Processing order {$order_id}");
-        error_log("WATI Debug: Status: " . $order->get_status());
-        error_log("WATI Debug: Modified: " . $order->get_date_modified()->format('Y-m-d H:i:s'));
-        error_log("WATI Debug: Time diff: {$time_diff} seconds");
-        error_log("WATI Debug: Required delay: " . ($delay_minutes * 60) . " seconds");
-        error_log("WATI Debug: Notification sent before: " . (get_option($notification_key) ? 'Yes' : 'No'));
-
-        $order_info = array(
-            'id' => $order_id,
-            'date' => $order->get_date_created()->format('Y-m-d H:i:s'),
-            'modified_date' => $order->get_date_modified()->format('Y-m-d H:i:s'),
-            'total' => $order->get_total(),
-            'customer' => $order->get_billing_first_name() . ' ' . $order->get_billing_last_name(),
-            'phone' => $order->get_billing_phone(),
-            'customer_id' => $order->get_customer_id(),
-            'status' => $order->get_status()
-        );
-
-        // Skip if notification already sent
-        if (get_option($notification_key)) {
-            error_log("WATI Debug: Order {$order_id} already notified");
-            $order_info['status'] = 'already_notified';
-            $details['already_notified']++;
-            continue;
-        }
-
-        // Skip if not enough time has passed (unless testing)
-        if ($time_diff < ($delay_minutes * 60) && !$is_test) {
-            error_log("WATI Debug: Order {$order_id} not ready for notification yet");
-            continue;
-        }
-
-        if (empty($order->get_billing_phone())) {
-            error_log("WATI Debug: Order {$order_id} has no phone number");
-            $order_info['status'] = 'no_phone';
-            $details['no_phone']++;
-            continue;
-        }
-
-        $order_info['status'] = 'eligible';
-        $details['eligible_orders']++;
-        
-        if (!$is_test) {
-            // Add random delay before sending if not the first message
-            if ($details['eligible_orders'] > 1) {
-                wati_random_delay();
+        try {
+            $order = wc_get_order($order_id);
+            if (!$order || $order->get_type() === 'shop_order_refund') {
+                error_log("WATI Debug: Skipping order {$order_id} - invalid order or refund");
+                continue;
             }
 
-            $variables = array();
-            foreach ($settings['conditions']['shipped']['variables'] as $var) {
-                switch ($var['type']) {
-                    case 'customer_name':
-                        $variables[] = array(
-                            'name' => $var['template_name'],
-                            'value' => $order->get_billing_first_name()
-                        );
-                        break;
-                    case 'order_number':
-                        $variables[] = array(
-                            'name' => $var['template_name'],
-                            'value' => $order_id
-                        );
-                        break;
-                    case 'tracking_number':
-                        $tracking_number = get_post_meta($order_id, 'smsa_awb_no', true);
-                        if (!empty($tracking_number)) {
+            // Get the status change time
+            $status_changed = $order->get_date_modified()->getTimestamp();
+            $time_diff = time() - $status_changed;
+            $notification_key = 'wati_shipped_' . $order_id;
+
+            error_log("WATI Debug: Processing order {$order_id}");
+            error_log("WATI Debug: Status: " . $order->get_status());
+            error_log("WATI Debug: Modified: " . $order->get_date_modified()->format('Y-m-d H:i:s'));
+            error_log("WATI Debug: Time diff: {$time_diff} seconds");
+            error_log("WATI Debug: Required delay: " . ($delay_minutes * 60) . " seconds");
+            error_log("WATI Debug: Notification sent before: " . (get_option($notification_key) ? 'Yes' : 'No'));
+
+            $order_info = array(
+                'id' => $order_id,
+                'date' => $order->get_date_created()->format('Y-m-d H:i:s'),
+                'modified_date' => $order->get_date_modified()->format('Y-m-d H:i:s'),
+                'total' => $order->get_total(),
+                'customer' => $order->get_billing_first_name() . ' ' . $order->get_billing_last_name(),
+                'phone' => $order->get_billing_phone(),
+                'customer_id' => $order->get_customer_id(),
+                'status' => $order->get_status()
+            );
+
+            // Skip if notification already sent
+            if (get_option($notification_key)) {
+                error_log("WATI Debug: Order {$order_id} already notified");
+                $order_info['status'] = 'already_notified';
+                $details['already_notified']++;
+                continue;
+            }
+
+            // Skip if not enough time has passed (unless testing)
+            if ($time_diff < ($delay_minutes * 60) && !$is_test) {
+                error_log("WATI Debug: Order {$order_id} not ready for notification yet");
+                continue;
+            }
+
+            if (empty($order->get_billing_phone())) {
+                error_log("WATI Debug: Order {$order_id} has no phone number");
+                $order_info['status'] = 'no_phone';
+                $details['no_phone']++;
+                continue;
+            }
+
+            $order_info['status'] = 'eligible';
+            $details['eligible_orders']++;
+            
+            if (!$is_test) {
+                // Add random delay before sending if not the first message
+                if ($details['eligible_orders'] > 1) {
+                    wati_random_delay();
+                }
+
+                $variables = array();
+                foreach ($settings['conditions']['shipped']['variables'] as $var) {
+                    switch ($var['type']) {
+                        case 'customer_name':
                             $variables[] = array(
                                 'name' => $var['template_name'],
-                                'value' => $tracking_number
+                                'value' => $order->get_billing_first_name()
                             );
-                        }
-                        break;
-                    case 'tracking_url':
-                        $tracking_number = get_post_meta($order_id, 'smsa_awb_no', true);
-                        if (!empty($tracking_number)) {
-                            $tracking_url = "https://www.smsaexpress.com/sa/ar/trackingdetails?tracknumbers=" . $tracking_number;
+                            break;
+                        case 'order_number':
                             $variables[] = array(
                                 'name' => $var['template_name'],
-                                'value' => $tracking_url
+                                'value' => $order_id
                             );
-                        }
-                        break;
+                            break;
+                        case 'tracking_number':
+                            $tracking_number = get_post_meta($order_id, 'smsa_awb_no', true);
+                            if (!empty($tracking_number)) {
+                                $variables[] = array(
+                                    'name' => $var['template_name'],
+                                    'value' => $tracking_number
+                                );
+                            }
+                            break;
+                        case 'tracking_url':
+                            $tracking_number = get_post_meta($order_id, 'smsa_awb_no', true);
+                            if (!empty($tracking_number)) {
+                                $tracking_url = "https://www.smsaexpress.com/sa/ar/trackingdetails?tracknumbers=" . $tracking_number;
+                                $variables[] = array(
+                                    'name' => $var['template_name'],
+                                    'value' => $tracking_url
+                                );
+                            }
+                            break;
+                    }
+                }
+
+                error_log("WATI Debug: Attempting to send notification for order {$order_id}");
+                error_log("WATI Debug: Template: " . $settings['conditions']['shipped']['template_name']);
+                error_log("WATI Debug: Variables: " . print_r($variables, true));
+
+                if (send_wati_template($order->get_billing_phone(), $settings['conditions']['shipped']['template_name'], $variables)) {
+                    update_option($notification_key, current_time('mysql'), false);
+                    $order_info['notification_sent'] = true;
+                    error_log("WATI Debug: Successfully sent notification for order {$order_id}");
+                } else {
+                    error_log("WATI Debug: Failed to send notification for order {$order_id}");
                 }
             }
 
-            error_log("WATI Debug: Attempting to send notification for order {$order_id}");
-            error_log("WATI Debug: Template: " . $settings['conditions']['shipped']['template_name']);
-            error_log("WATI Debug: Variables: " . print_r($variables, true));
-
-            if (send_wati_template($order->get_billing_phone(), $settings['conditions']['shipped']['template_name'], $variables)) {
-                update_option($notification_key, current_time('mysql'), false);
-                $order_info['notification_sent'] = true;
-                error_log("WATI Debug: Successfully sent notification for order {$order_id}");
-            } else {
-                error_log("WATI Debug: Failed to send notification for order {$order_id}");
-            }
+            $details['found_orders'][] = $order_info;
+        } catch (Exception $e) {
+            error_log('WATI Debug: Error processing order ' . $order_id . ': ' . $e->getMessage());
+            continue;
         }
-
-        $details['found_orders'][] = $order_info;
     }
 
     return $details;
@@ -1554,9 +1559,10 @@ add_action('wati_cleanup_old_logs', 'wati_cleanup_old_logs');
 function test_abandoned_check() {
     check_ajax_referer('wati_ajax_nonce', 'nonce');
     
-    error_log('WATI Debug: Manual test check initiated');
+    error_log('WATI Debug: Starting manual test check');
     
     $settings = get_option('wati_notifications_settings', array());
+    error_log('WATI Debug: Retrieved settings: ' . print_r($settings, true));
     
     if (empty($settings['enable_feature'])) {
         error_log('WATI Debug: Feature is disabled in settings');
@@ -1566,6 +1572,16 @@ function test_abandoned_check() {
 
     $checks_performed = array();
     $check_details = array();
+
+    // Check tracking notifications first
+    if (!empty($settings['conditions']['tracking']['enabled'])) {
+        error_log('WATI Debug: Testing tracking notifications...');
+        $tracking_details = check_tracking_notifications($settings, true);
+        $checks_performed['tracking'] = true;
+        $check_details['tracking'] = $tracking_details;
+    } else {
+        error_log('WATI Debug: Tracking notifications are disabled');
+    }
 
     // Check abandoned carts
     if (!empty($settings['conditions']['abandoned']['enabled'])) {
@@ -1599,12 +1615,17 @@ function test_abandoned_check() {
         $check_details['shipped'] = $shipped_details;
     }
 
-    // Log test completion
+    // Log test completion with more details
     wati_log_notification('test', '', '', 'info', array(
         'message' => 'Manual test completed',
         'checks_performed' => $checks_performed,
         'check_details' => $check_details,
-        'time' => current_time('mysql')
+        'time' => current_time('mysql'),
+        'settings_state' => array(
+            'feature_enabled' => !empty($settings['enable_feature']),
+            'tracking_enabled' => !empty($settings['conditions']['tracking']['enabled']),
+            'tracking_template' => $settings['conditions']['tracking']['template_name'] ?? 'not set'
+        )
     ));
 
     wp_send_json_success(array(
@@ -1942,6 +1963,16 @@ function wati_track_order_status_change($order_id, $old_status, $new_status, $or
             check_shipped_orders($settings);
         }
     }
+
+    // Check for tracking number when status changes
+    $tracking_number = get_post_meta($order_id, 'smsa_awb_no', true);
+    if (!empty($tracking_number)) {
+        error_log("WATI Debug: Tracking number found for order {$order_id}");
+        $settings = get_option('wati_notifications_settings', array());
+        if (!empty($settings['conditions']['tracking']['enabled'])) {
+            check_tracking_notifications($settings);
+        }
+    }
 }
 
 // Check custom template notifications
@@ -2089,6 +2120,9 @@ function check_custom_notifications($settings, $is_test = false) {
 function check_tracking_notifications($settings, $is_test = false) {
     global $wpdb;
     
+    error_log('WATI Debug: Starting tracking notifications check with detailed logging');
+    error_log('WATI Debug: Settings for tracking: ' . print_r($settings['conditions']['tracking'], true));
+    
     $details = array(
         'condition' => $settings['conditions']['tracking'],
         'found_orders' => array(),
@@ -2098,32 +2132,41 @@ function check_tracking_notifications($settings, $is_test = false) {
         'no_phone' => 0
     );
 
-    // Get the delay time
-    $condition = $settings['conditions']['tracking'];
-    $delay_minutes = $condition['delay_unit'] === 'hours' ? 
-        $condition['delay_time'] * 60 : 
-        $condition['delay_time'];
+    // Verify tracking notifications are enabled
+    if (empty($settings['conditions']['tracking']['enabled'])) {
+        error_log('WATI Debug: Tracking notifications are disabled in settings');
+        return $details;
+    }
 
-    // Get orders with tracking numbers
-    $args = array(
-        'status' => array('any'),
-        'limit' => -1,
-        'return' => 'ids',
-        'meta_query' => array(
-            array(
-                'key' => 'smsa_awb_no',
-                'compare' => 'EXISTS'
-            )
-        )
+    // Direct database query to verify tracking numbers exist
+    $tracking_numbers = $wpdb->get_results(
+        "SELECT post_id, meta_value 
+         FROM {$wpdb->postmeta} 
+         WHERE meta_key = 'smsa_awb_no' 
+         AND meta_value IS NOT NULL 
+         AND meta_value != ''",
+        ARRAY_A
     );
     
-    $order_ids = wc_get_orders($args);
-    $details['total_orders'] = count($order_ids);
+    error_log('WATI Debug: Found tracking numbers in database: ' . print_r($tracking_numbers, true));
 
-    error_log('WATI Debug: Found ' . count($order_ids) . ' orders with tracking numbers');
+    if (empty($tracking_numbers)) {
+        error_log('WATI Debug: No orders found with tracking numbers');
+        return $details;
+    }
+
+    // Extract order IDs with valid tracking numbers
+    $order_ids = array_map(function($row) {
+        return $row['post_id'];
+    }, $tracking_numbers);
+
+    error_log('WATI Debug: Order IDs with tracking numbers: ' . print_r($order_ids, true));
+
+    $details['total_orders'] = count($order_ids);
 
     // Add user filter
     if (!empty($settings['specific_users'])) {
+        error_log('WATI Debug: Filtering for specific users: ' . print_r($settings['specific_users'], true));
         $filtered_order_ids = array();
         foreach ($order_ids as $order_id) {
             $order = wc_get_order($order_id);
@@ -2132,17 +2175,22 @@ function check_tracking_notifications($settings, $is_test = false) {
             }
         }
         $order_ids = $filtered_order_ids;
+        error_log('WATI Debug: After user filtering, remaining orders: ' . count($order_ids));
     }
 
     foreach ($order_ids as $order_id) {
         $order = wc_get_order($order_id);
-        if (!$order) continue;
+        if (!$order) {
+            error_log("WATI Debug: Could not load order {$order_id}");
+            continue;
+        }
 
         $notification_key = 'wati_tracking_' . $order_id;
         $tracking_number = get_post_meta($order_id, 'smsa_awb_no', true);
 
-        error_log("WATI Debug: Processing order {$order_id} for tracking template");
+        error_log("WATI Debug: Processing order {$order_id}");
         error_log("WATI Debug: Tracking number: {$tracking_number}");
+        error_log("WATI Debug: Previous notification check: " . (get_option($notification_key) ? 'Yes' : 'No'));
 
         $order_info = array(
             'id' => $order_id,
@@ -2154,6 +2202,8 @@ function check_tracking_notifications($settings, $is_test = false) {
             'status' => $order->get_status(),
             'tracking_number' => $tracking_number
         );
+
+        error_log("WATI Debug: Order info: " . print_r($order_info, true));
 
         // Skip if notification already sent
         if (get_option($notification_key)) {
@@ -2214,9 +2264,9 @@ function check_tracking_notifications($settings, $is_test = false) {
                 }
             }
 
+            error_log("WATI Debug: Template variables prepared: " . print_r($variables, true));
             error_log("WATI Debug: Attempting to send tracking notification for order {$order_id}");
             error_log("WATI Debug: Template: " . $settings['conditions']['tracking']['template_name']);
-            error_log("WATI Debug: Variables: " . print_r($variables, true));
 
             if (send_wati_template($order->get_billing_phone(), $settings['conditions']['tracking']['template_name'], $variables)) {
                 update_option($notification_key, current_time('mysql'), false);
@@ -2230,5 +2280,29 @@ function check_tracking_notifications($settings, $is_test = false) {
         $details['found_orders'][] = $order_info;
     }
 
+    error_log('WATI Debug: Tracking check completed. Details: ' . print_r($details, true));
     return $details;
 }
+
+// Add hook for tracking number updates
+function wati_track_tracking_number_update($meta_id, $post_id, $meta_key, $meta_value) {
+    // Only proceed if this is a tracking number update
+    if ($meta_key !== 'smsa_awb_no' || empty($meta_value)) {
+        return;
+    }
+
+    error_log("WATI Debug: Tracking number updated for order {$post_id}: {$meta_value}");
+    
+    // Check if this is a WooCommerce order
+    if (get_post_type($post_id) !== 'shop_order') {
+        return;
+    }
+
+    $settings = get_option('wati_notifications_settings', array());
+    if (!empty($settings['conditions']['tracking']['enabled'])) {
+        error_log("WATI Debug: Triggering tracking notification check for order {$post_id}");
+        check_tracking_notifications($settings);
+    }
+}
+add_action('updated_post_meta', 'wati_track_tracking_number_update', 10, 4);
+add_action('added_post_meta', 'wati_track_tracking_number_update', 10, 4);
