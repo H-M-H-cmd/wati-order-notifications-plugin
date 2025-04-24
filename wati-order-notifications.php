@@ -11,6 +11,26 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
+// Add this function to check if the plugin is active
+function wati_is_plugin_active() {
+    // Check if the plugin file exists and is activated
+    if (!function_exists('is_plugin_active')) {
+        include_once(ABSPATH . 'wp-admin/includes/plugin.php');
+    }
+    
+    $plugin_file = 'wati-order-notifications/wati-order-notifications.php';
+    // This gets the relative path if this file is in a subdirectory
+    $plugin_path = plugin_basename(__FILE__);
+    
+    $is_active = is_plugin_active($plugin_path);
+    
+    if (!$is_active) {
+        error_log('WATI Debug: Plugin is not active, terminating processing');
+    }
+    
+    return $is_active;
+}
+
 // Register activation/deactivation hooks
 register_activation_hook(__FILE__, 'wati_notifications_activation');
 register_deactivation_hook(__FILE__, 'wati_notifications_deactivation');
@@ -143,35 +163,6 @@ function wati_notifications_settings_page_html() {
         <h1 class="wp-heading-inline">WATI Notifications Settings</h1>
         
         <?php settings_errors('wati_messages'); ?>
-        
-        <!-- Emergency Controls Card -->
-        <div class="card emergency-controls">
-            <div class="card-header">
-                <h2><span class="dashicons dashicons-warning"></span> Emergency Controls</h2>
-                <p class="description">Use these controls in case of emergency to stop all notifications immediately.</p>
-            </div>
-            
-            <?php if (wati_check_emergency_stop()): ?>
-                <div class="notice notice-warning">
-                    <p><span class="dashicons dashicons-warning"></span> Emergency stop is currently active. No notifications will be sent until this is cleared.</p>
-                </div>
-                <form method="post" action="" class="emergency-form">
-                    <?php wp_nonce_field('wati_clear_emergency_stop'); ?>
-                    <button type="submit" name="clear_emergency_stop" class="button button-primary">
-                        <span class="dashicons dashicons-yes"></span> Clear Emergency Stop
-                    </button>
-                </form>
-            <?php else: ?>
-                <form method="post" action="" class="emergency-form">
-                    <?php wp_nonce_field('wati_emergency_stop'); ?>
-                    <button type="submit" name="activate_emergency_stop" class="button button-danger" 
-                           onclick="return confirm('Are you sure you want to activate emergency stop? This will immediately stop all notifications.');">
-                        <span class="dashicons dashicons-no"></span> Activate Emergency Stop
-                    </button>
-                </form>
-            <?php endif; ?>
-        </div>
-
         <!-- Order Reset Card -->
         <div class="card order-reset">
             <div class="card-header">
@@ -1019,6 +1010,9 @@ function wati_notifications_activation() {
 function wati_notifications_deactivation() {
     error_log('WATI Debug: Plugin deactivated, performing cleanup');
     
+    // Set emergency stop signal to stop any running processes
+    wati_emergency_stop();
+    
     // Clear all cron jobs
     wp_clear_scheduled_hook('wati_check_notifications');
     wp_clear_scheduled_hook('wati_cleanup_old_logs');
@@ -1216,14 +1210,15 @@ function verify_wati_template_ajax() {
 
 // Update the send_wati_template function
 function send_wati_template($phone_number, $template_name, $variables = array()) {
-    // Check both emergency stop and stop signal
-    if (wati_check_emergency_stop() || wati_check_stop_signal()) {
-        error_log('WATI Debug: Message sending stopped due to emergency stop/signal. Phone: ' . $phone_number);
+    // First check if plugin is still active
+    if (!wati_is_plugin_active()) {
+        error_log('WATI Debug: Plugin is not active. Stopping message send to: ' . $phone_number);
         return false;
     }
     
-    if (wati_check_emergency_stop()) {
-        error_log('WATI Debug: Emergency stop active - skipping template send');
+    // Check both emergency stop and stop signal - immediate check
+    if (wati_check_emergency_stop() || wati_check_stop_signal()) {
+        error_log('WATI Debug: Message sending stopped due to emergency stop/signal. Phone: ' . $phone_number);
         return false;
     }
     
@@ -1245,6 +1240,12 @@ function send_wati_template($phone_number, $template_name, $variables = array())
             'retry_count' => $retry_count,
             'message' => 'Message skipped after 3 failed attempts'
         ));
+        return false;
+    }
+
+    // Double-check emergency stop again - aggressive checking
+    if (wati_check_emergency_stop(true) || wati_check_stop_signal()) {
+        error_log('WATI Debug: Emergency stop detected during message preparation. Aborting send to: ' . $phone_number);
         return false;
     }
 
@@ -1279,6 +1280,12 @@ function send_wati_template($phone_number, $template_name, $variables = array())
             'original_number' => $phone_number,
             'cleaned_number' => $whatsapp_number
         ));
+        return false;
+    }
+
+    // One final emergency stop check before API call - critical point
+    if (wati_check_emergency_stop(true) || wati_check_stop_signal()) {
+        error_log('WATI Debug: Emergency stop detected right before API call. Aborting send to: ' . $phone_number);
         return false;
     }
 
@@ -1323,6 +1330,12 @@ function send_wati_template($phone_number, $template_name, $variables = array())
         ),
         'body' => json_encode($request_body)
     ));
+
+    // Check emergency stop again after API call - prevent further processing
+    if (wati_check_emergency_stop(true) || wati_check_stop_signal()) {
+        error_log('WATI Debug: Emergency stop detected after API call. Aborting next steps for: ' . $phone_number);
+        return false;
+    }
 
     if (is_wp_error($response)) {
         $error_message = $response->get_error_message();
@@ -1383,6 +1396,17 @@ function send_wati_template($phone_number, $template_name, $variables = array())
 
 // Check notifications function (runs every 5 minutes)
 function wati_check_notifications() {
+    // Force terminate if emergency stop is active
+    wati_force_terminate_if_emergency();
+    
+    // First check if plugin is still active
+    if (!wati_is_plugin_active()) {
+        error_log('WATI Debug: Plugin is not active. Terminating notification check.');
+        // Clear processing state
+        delete_option('wati_notification_processing');
+        return;
+    }
+    
     // Check for emergency stop before processing any notifications
     if (wati_check_emergency_stop() || wati_check_stop_signal()) {
         error_log('WATI Debug: Skipping notification check due to active emergency stop');
@@ -1422,28 +1446,32 @@ function wati_check_notifications() {
     ));
 
     try {
-    // Check tracking notifications first since it's independent of order status
-    if (!empty($settings['conditions']['tracking']['enabled'])) {
-            if (wati_check_emergency_stop() || wati_check_stop_signal()) {
+        // Critical termination check before starting any work
+        wati_force_terminate_if_emergency();
+        
+        // Check tracking notifications first since it's independent of order status
+        if (!empty($settings['conditions']['tracking']['enabled'])) {
+            if (wati_check_emergency_stop(true) || wati_check_stop_signal()) {
                 error_log('WATI Debug: Emergency stop active - stopping tracking notifications');
                 return;
             }
-        error_log('WATI Debug: Starting tracking notifications check from cron...');
-        try {
-            $tracking_results = check_tracking_notifications($settings);
-            error_log('WATI Debug: Tracking check completed. Results: ' . print_r($tracking_results, true));
             
-            wati_log_notification('cron', '', '', 'info', array(
-                'message' => 'Tracking notifications check completed',
-                'tracking_results' => $tracking_results
-            ));
-        } catch (Exception $e) {
-            error_log('WATI Debug: Error in tracking notifications: ' . $e->getMessage());
-            wati_log_notification('error', '', '', 'error', array(
-                'message' => 'Error in tracking notifications',
-                'error' => $e->getMessage()
-            ));
-        }
+            error_log('WATI Debug: Starting tracking notifications check from cron...');
+            try {
+                $tracking_results = check_tracking_notifications($settings);
+                error_log('WATI Debug: Tracking check completed. Results: ' . print_r($tracking_results, true));
+                
+                wati_log_notification('cron', '', '', 'info', array(
+                    'message' => 'Tracking notifications check completed',
+                    'tracking_results' => $tracking_results
+                ));
+            } catch (Exception $e) {
+                error_log('WATI Debug: Error in tracking notifications: ' . $e->getMessage());
+                wati_log_notification('error', '', '', 'error', array(
+                    'message' => 'Error in tracking notifications',
+                    'error' => $e->getMessage()
+                ));
+            }
         }
 
         // Check other notifications in batches
@@ -1455,7 +1483,10 @@ function wati_check_notifications() {
         );
 
         foreach ($notification_types as $type => $callback) {
-            if (wati_check_emergency_stop() || wati_check_stop_signal()) {
+            // Force terminate if emergency stop is active - critical check
+            wati_force_terminate_if_emergency();
+            
+            if (wati_check_emergency_stop(true) || wati_check_stop_signal()) {
                 error_log("WATI Debug: Emergency stop active - stopping {$type} notifications");
                 return;
             }
@@ -1476,9 +1507,15 @@ function wati_check_notifications() {
                     ));
                 }
             }
-    }
+            
+            // Check for emergency stop after each notification type
+            if (wati_check_emergency_stop(true) || wati_check_stop_signal()) {
+                error_log("WATI Debug: Emergency stop detected after {$type} check. Stopping remaining checks.");
+                break;
+            }
+        }
 
-    error_log('WATI Debug: Scheduled check completed at ' . current_time('mysql'));
+        error_log('WATI Debug: Scheduled check completed at ' . current_time('mysql'));
 
     } catch (Exception $e) {
         error_log('WATI Debug: Error in notification check: ' . $e->getMessage());
@@ -1491,13 +1528,32 @@ add_action('wati_check_notifications', 'wati_check_notifications');
 
 // Add this helper function at the top of the file
 function wati_random_delay() {
+    // Check if plugin is still active before sleeping
+    if (!wati_is_plugin_active()) {
+        error_log('WATI Debug: Plugin is not active. Skipping delay and terminating process.');
+        return false;
+    }
+    
     $delay = rand(5, 10);
     error_log("WATI Debug: Sleeping for {$delay} seconds before next message");
     sleep($delay);
+    
+    // Check again after the delay
+    return wati_is_plugin_active();
 }
 
 // Check abandoned carts
 function check_abandoned_carts($settings, $is_test = false) {
+    // Check if plugin is still active
+    if (!wati_is_plugin_active() && !$is_test) {
+        error_log('WATI Debug: Plugin is not active. Terminating abandoned cart check.');
+        return array(
+            'condition' => isset($settings['conditions']['abandoned']) ? $settings['conditions']['abandoned'] : array(),
+            'error' => 'Plugin not active',
+            'total_carts' => 0
+        );
+    }
+    
     global $wpdb;
     
     $details = array(
@@ -1541,6 +1597,12 @@ function check_abandoned_carts($settings, $is_test = false) {
     $details['total_carts'] = count($abandoned_carts);
 
     foreach ($abandoned_carts as $cart) {
+        // Check if plugin is still active before processing each cart
+        if (!wati_is_plugin_active() && !$is_test) {
+            error_log('WATI Debug: Plugin is no longer active during abandoned cart check. Stopping processing.');
+            break;
+        }
+        
         $cart_info = array(
             'id' => $cart->id,
             'email' => $cart->email,
@@ -1580,7 +1642,10 @@ function check_abandoned_carts($settings, $is_test = false) {
         if (!$is_test) {
             // Add random delay before sending if not the first message
             if ($details['eligible_carts'] > 0) {
-                wati_random_delay();
+                // If wati_random_delay returns false, plugin is not active anymore
+                if (!wati_random_delay()) {
+                    break;
+                }
             }
 
             // Actual sending logic
@@ -1664,7 +1729,10 @@ function check_processing_orders($settings, $is_test = false) {
         if (!$is_test) {
             // Add random delay before sending if not the first message
             if ($details['eligible_orders'] > 0) {
-                wati_random_delay();
+                // If wati_random_delay returns false, plugin is not active anymore
+                if (!wati_random_delay()) {
+                    break;
+                }
             }
 
             $variables = array();
@@ -1813,7 +1881,10 @@ function check_shipped_orders($settings, $is_test = false) {
             if (!$is_test) {
                 // Add random delay before sending if not the first message
                 if ($details['eligible_orders'] > 1) {
-                    wati_random_delay();
+                    // If wati_random_delay returns false, plugin is not active anymore
+                    if (!wati_random_delay()) {
+                        break;
+                    }
                 }
 
                 $variables = array();
@@ -2743,7 +2814,10 @@ function check_discount_notifications($settings, $is_test = false) {
         if (!$is_test) {
             // Add random delay before sending if not the first message
             if ($details['eligible_carts'] > 0) {
-                wati_random_delay();
+                // If wati_random_delay returns false, plugin is not active anymore
+                if (!wati_random_delay()) {
+                    break;
+                }
             }
 
             if (send_wati_template($phone, $condition['template_name'], $variables)) {
@@ -2920,7 +2994,10 @@ function check_custom_notifications($settings, $is_test = false) {
         if (!$is_test) {
             // Add random delay before sending if not the first message
             if ($details['eligible_orders'] > 1) {
-                wati_random_delay();
+                // If wati_random_delay returns false, plugin is not active anymore
+                if (!wati_random_delay()) {
+                    break;
+                }
             }
 
             $variables = array();
@@ -3098,7 +3175,10 @@ function check_tracking_notifications($settings, $is_test = false) {
         if (!$is_test) {
             // Add random delay before sending if not the first message
             if ($details['eligible_orders'] > 1) {
-                wati_random_delay();
+                // If wati_random_delay returns false, plugin is not active anymore
+                if (!wati_random_delay()) {
+                    break;
+                }
             }
 
             $variables = array();
@@ -3200,23 +3280,48 @@ function wati_rate_limit_check() {
 }
 
 function wati_emergency_stop() {
-    // Set both transient and option for redundancy
-    set_transient('wati_emergency_stop', array(
-        'active' => true,
-        'timestamp' => current_time('mysql'),
-        'process_id' => getmypid()
-    ), 12 * HOUR_IN_SECONDS);
+    global $wpdb;
     
-    update_option('wati_emergency_stop', array(
-        'active' => true,
-        'timestamp' => current_time('mysql'),
-        'process_id' => getmypid()
-    ));
-
-    // Log the emergency stop
     error_log('WATI Debug: Emergency stop activated for WATI notifications by process ' . getmypid());
     
-    // Stop only WATI notification processes
+    // Store process ID and timestamp
+    $emergency_data = array(
+        'active' => true,
+        'timestamp' => current_time('mysql'),
+        'process_id' => getmypid()
+    );
+    
+    // Set both transient and option for redundancy with serialized value for consistency
+    $serialized_data = serialize($emergency_data);
+    
+    // Direct DB writes to ensure they happen immediately
+    $wpdb->query($wpdb->prepare(
+        "INSERT INTO {$wpdb->options} (option_name, option_value, autoload) 
+         VALUES (%s, %s, %s) 
+         ON DUPLICATE KEY UPDATE option_value = %s",
+        'wati_emergency_stop', $serialized_data, 'yes', $serialized_data
+    ));
+    
+    $wpdb->query($wpdb->prepare(
+        "INSERT INTO {$wpdb->options} (option_name, option_value, autoload) 
+         VALUES (%s, %s, %s) 
+         ON DUPLICATE KEY UPDATE option_value = %s",
+        '_transient_wati_emergency_stop', $serialized_data, 'no', $serialized_data
+    ));
+    
+    // Also write to options API for redundancy
+    update_option('wati_emergency_stop', $emergency_data, 'yes');
+    set_transient('wati_emergency_stop', $emergency_data, 12 * HOUR_IN_SECONDS);
+    
+    // Set stop signal with current timestamp
+    $wpdb->query($wpdb->prepare(
+        "INSERT INTO {$wpdb->options} (option_name, option_value, autoload) 
+         VALUES (%s, %s, %s) 
+         ON DUPLICATE KEY UPDATE option_value = %s",
+        'wati_notification_stop_signal', current_time('mysql'), 'yes', current_time('mysql')
+    ));
+    
+    // Try to stop only WATI notification processes
     wati_terminate_notification_processes();
     
     // Force kill any remaining WATI processes
@@ -3228,6 +3333,9 @@ function wati_emergency_stop() {
     // Clear WATI processing state
     wati_clear_processing_state();
     
+    // Reset retry counters
+    wati_reset_retry_counts();
+    
     // Log the emergency stop with detailed information
     wati_log_notification('emergency', '', '', 'warning', array(
         'message' => 'Emergency stop activated for WATI notifications',
@@ -3238,7 +3346,44 @@ function wati_emergency_stop() {
     return true;
 }
 
-function wati_check_emergency_stop() {
+function wati_check_emergency_stop($bypass_cache = false) {
+    global $wpdb;
+    
+    // If bypass_cache is true, directly check the database
+    if ($bypass_cache) {
+        $option_value = $wpdb->get_var("
+            SELECT option_value FROM {$wpdb->options} 
+            WHERE option_name = 'wati_emergency_stop' 
+            LIMIT 1
+        ");
+        
+        if ($option_value) {
+            $emergency_stop = maybe_unserialize($option_value);
+            if (is_array($emergency_stop) && isset($emergency_stop['active']) && $emergency_stop['active']) {
+                error_log('WATI Debug: Emergency stop check (DB direct) - Stop is active');
+                return true;
+            }
+        }
+        
+        // Also check the transient directly for thoroughness
+        $transient_value = $wpdb->get_var("
+            SELECT option_value FROM {$wpdb->options} 
+            WHERE option_name = '_transient_wati_emergency_stop' 
+            LIMIT 1
+        ");
+        
+        if ($transient_value) {
+            $transient_stop = maybe_unserialize($transient_value);
+            if (is_array($transient_stop) && isset($transient_stop['active']) && $transient_stop['active']) {
+                error_log('WATI Debug: Emergency stop check (transient DB direct) - Stop is active');
+                return true;
+            }
+        }
+        
+        return false;
+    }
+    
+    // Standard check for normal operation (cached)
     // Check transient first (faster)
     $emergency_stop = get_transient('wati_emergency_stop');
     
@@ -3248,7 +3393,7 @@ function wati_check_emergency_stop() {
     }
     
     // If emergency stop is active, log it
-    if (is_array($emergency_stop) && $emergency_stop['active']) {
+    if (is_array($emergency_stop) && isset($emergency_stop['active']) && $emergency_stop['active']) {
         error_log('WATI Debug: Emergency stop check - Stop is active (set by process ' . 
             (isset($emergency_stop['process_id']) ? $emergency_stop['process_id'] : 'unknown') . 
             ' at ' . $emergency_stop['timestamp'] . ')');
@@ -3284,8 +3429,12 @@ function wati_terminate_notification_processes() {
 function wati_check_stop_signal() {
     global $wpdb;
     
-    // Check if stop signal is set specifically for WATI notifications
-    $stop_signal = get_option('wati_notification_stop_signal', false);
+    // Direct DB check for maximum reliability - bypass cache
+    $stop_signal = $wpdb->get_var("
+        SELECT option_value FROM {$wpdb->options} 
+        WHERE option_name = 'wati_notification_stop_signal' 
+        LIMIT 1
+    ");
     
     if ($stop_signal) {
         // Check if signal is recent (within last 5 minutes)
@@ -3313,6 +3462,12 @@ function wati_check_order_date($order_date) {
 
 // Update the batch processing function to include both rate limit and emergency stop checks
 function wati_process_orders_in_batches($order_ids, $callback, $batch_size = 50) {
+    // First check if plugin is still active
+    if (!wati_is_plugin_active()) {
+        error_log('WATI Debug: Plugin is not active. Terminating batch processing.');
+        return;
+    }
+    
     // Check both emergency stop and stop signal at the start
     if (wati_check_emergency_stop() || wati_check_stop_signal()) {
         error_log('WATI Debug: Emergency stop/signal active - skipping batch processing');
@@ -3335,6 +3490,12 @@ function wati_process_orders_in_batches($order_ids, $callback, $batch_size = 50)
     error_log("WATI Debug: Starting batch processing of {$total_orders} orders in {$total_batches} batches (Process ID: " . getmypid() . ")");
     
     foreach ($batches as $batch_index => $batch) {
+        // Check if plugin is still active before each batch
+        if (!wati_is_plugin_active()) {
+            error_log("WATI Debug: Plugin is no longer active during batch processing. Stopped at batch {$batch_index} of {$total_batches}");
+            return;
+        }
+        
         // Check emergency stop and stop signal before each batch
         if (wati_check_emergency_stop() || wati_check_stop_signal()) {
             error_log("WATI Debug: Emergency stop/signal activated during batch processing. Stopped at batch {$batch_index} of {$total_batches}");
@@ -3352,6 +3513,12 @@ function wati_process_orders_in_batches($order_ids, $callback, $batch_size = 50)
         
         // Process each order individually
         foreach ($batch as $order_id) {
+            // Check if plugin is still active before each order
+            if (!wati_is_plugin_active()) {
+                error_log("WATI Debug: Plugin is no longer active during order processing. Stopped at order {$order_id}");
+                return;
+            }
+            
             // Check emergency stop and stop signal before each order
             if (wati_check_emergency_stop() || wati_check_stop_signal()) {
                 error_log("WATI Debug: Emergency stop/signal activated during order processing. Stopped at order {$order_id}");
@@ -3490,22 +3657,101 @@ function wati_kill_notification_processes() {
 }
 
 function wati_emergency_stop_disable() {
-    // Clear both transient and option
-    delete_transient('wati_emergency_stop');
+    global $wpdb;
+    
+    error_log('WATI Debug: Emergency stop deactivated for WATI notifications by process ' . getmypid());
+    
+    // Get the emergency stop details before clearing
+    $emergency_stop = get_option('wati_emergency_stop', array());
+    $start_time = isset($emergency_stop['timestamp']) ? $emergency_stop['timestamp'] : '';
+    $process_id = isset($emergency_stop['process_id']) ? $emergency_stop['process_id'] : '';
+    
+    // Log the emergency stop period before clearing
+    if ($start_time) {
+        wati_log_notification('emergency', '', '', 'info', array(
+            'message' => 'Emergency stop period ended',
+            'start_time' => $start_time,
+            'end_time' => current_time('mysql'),
+            'duration' => strtotime(current_time('mysql')) - strtotime($start_time),
+            'start_process_id' => $process_id,
+            'end_process_id' => getmypid(),
+            'status' => 'deactivated'
+        ));
+    }
+    
+    // Clear emergency stop flags
     delete_option('wati_emergency_stop');
+    delete_transient('wati_emergency_stop');
     
     // Clear stop signal
     delete_option('wati_notification_stop_signal');
     
-    // Log the emergency stop disable
-    error_log('WATI Debug: Emergency stop disabled by process ' . getmypid());
+    // Clear processing state
+    wati_clear_processing_state();
     
-    // Log the action
+    // Reset retry counters
+    wati_reset_retry_counts();
+    
+    // Log the deactivation
     wati_log_notification('emergency', '', '', 'info', array(
-        'message' => 'Emergency stop disabled',
+        'message' => 'Emergency stop deactivated',
         'time' => current_time('mysql'),
-        'process_id' => getmypid()
+        'process_id' => getmypid(),
+        'status' => 'deactivated'
     ));
     
     return true;
 }
+
+// Add handling of plugin file deletion
+register_shutdown_function('wati_handle_plugin_shutdown');
+
+function wati_handle_plugin_shutdown() {
+    // Check if this file still exists
+    if (!file_exists(__FILE__)) {
+        error_log('WATI Debug: Plugin file deleted or moved. Setting emergency stop signal.');
+        // Use direct database query as plugin functions might not be available
+        global $wpdb;
+        $wpdb->query("
+            INSERT INTO {$wpdb->options} (option_name, option_value, autoload)
+            VALUES ('wati_emergency_stop', 'a:3:{s:6:\"active\";b:1;s:9:\"timestamp\";s:19:\"" . current_time('mysql') . "\";s:10:\"process_id\";i:" . getmypid() . ";}', 'yes')
+            ON DUPLICATE KEY UPDATE option_value = VALUES(option_value)
+        ");
+        
+        $wpdb->query("
+            INSERT INTO {$wpdb->options} (option_name, option_value, autoload)
+            VALUES ('wati_notification_stop_signal', NOW(), 'yes')
+            ON DUPLICATE KEY UPDATE option_value = NOW()
+        ");
+    }
+}
+
+// Add a new function to check emergency stop status in cron
+add_action('init', 'wati_check_emergency_on_init', 1);
+function wati_check_emergency_on_init() {
+    // Only run this check if we're in a WordPress cron process
+    if (defined('DOING_CRON') && DOING_CRON) {
+        if (wati_check_emergency_stop(true)) {
+            error_log('WATI Debug: Emergency stop detected during cron execution. Terminating process ' . getmypid());
+            
+            // Log the killed process
+            wati_log_notification('emergency', '', '', 'warning', array(
+                'message' => 'Cron process terminated due to emergency stop',
+                'time' => current_time('mysql'),
+                'process_id' => getmypid()
+            ));
+            
+            // Exit the process immediately
+            exit;
+        }
+    }
+}
+
+// Add a function to force-terminate in the event of an emergency stop - fail-safe mechanism
+function wati_force_terminate_if_emergency() {
+    if (wati_check_emergency_stop(true) || wati_check_stop_signal()) {
+        error_log('WATI Debug: Critical force-termination due to emergency stop/signal. Process ID: ' . getmypid());
+        exit;
+    }
+}
+
