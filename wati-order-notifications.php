@@ -2,7 +2,7 @@
 /*
 Plugin Name: WATI Order Notifications
 Description: Sends WhatsApp notifications for different order statuses using WATI API
-Version: 1.2.0
+Version: 2.0.0
 Author: Hamdy Mohammed
 */
 
@@ -3754,4 +3754,3 @@ function wati_force_terminate_if_emergency() {
         exit;
     }
 }
-
