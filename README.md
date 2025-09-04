@@ -96,7 +96,7 @@ Available variables for all notifications:
 - Access via WATI Notifications → Logs
 - Filter by notification type
 - View success/failure status
-- Automatic cleanup after 7 days
+- Automatic cleanup after 30 days (with a safety cap on total entries)
 
 ## Best Practices
 

@@ -2,13 +2,23 @@
 /*
 Plugin Name: WATI Order Notifications
 Description: Sends WhatsApp notifications for different order statuses using WATI API
-Version: 2.0.0
+Version: 3.1.0
 Author: Hamdy Mohammed
 */
 
 // Exit if accessed directly
 if (!defined('ABSPATH')) {
     exit;
+}
+
+// Log retention configuration
+if (!defined('WATI_LOG_RETENTION_DAYS')) {
+    // Keep logs for 30 days
+    define('WATI_LOG_RETENTION_DAYS', 30);
+}
+if (!defined('WATI_LOG_MAX_ENTRIES')) {
+    // Safety cap to prevent oversized option payloads
+    define('WATI_LOG_MAX_ENTRIES', 10000);
 }
 
 // Add this function to check if the plugin is active
@@ -988,22 +998,7 @@ function wati_render_variable_row($status, $var = array()) {
 // Activation hook
 function wati_notifications_activation() {
     error_log('WATI Debug: Plugin activated, registering cron jobs');
-    
-    // Clear any existing schedules
-    wp_clear_scheduled_hook('wati_check_notifications');
-    wp_clear_scheduled_hook('wati_cleanup_old_logs');
-    
-    // Schedule notification check
-    if (!wp_next_scheduled('wati_check_notifications')) {
-        wp_schedule_event(time(), 'wati_custom_interval', 'wati_check_notifications');
-        error_log('WATI Debug: Notification check cron job scheduled successfully');
-    }
-    
-    // Schedule log cleanup
-    if (!wp_next_scheduled('wati_cleanup_old_logs')) {
-        wp_schedule_event(time(), 'daily', 'wati_cleanup_old_logs');
-        error_log('WATI Debug: Log cleanup cron job scheduled successfully');
-    }
+    wati_schedule_cron_jobs();
 }
 
 // Deactivation hook
@@ -1025,6 +1020,25 @@ function wati_notifications_deactivation() {
     
     // Clear processing state
     wati_clear_processing_state();
+}
+
+// Helper to (re)schedule cron jobs safely
+function wati_schedule_cron_jobs() {
+    // Clear any existing schedules to avoid duplicates
+    wp_clear_scheduled_hook('wati_check_notifications');
+    wp_clear_scheduled_hook('wati_cleanup_old_logs');
+
+    // Schedule notification check
+    if (!wp_next_scheduled('wati_check_notifications')) {
+        wp_schedule_event(time(), 'wati_custom_interval', 'wati_check_notifications');
+        error_log('WATI Debug: Notification check cron job scheduled successfully');
+    }
+    
+    // Schedule log cleanup (daily)
+    if (!wp_next_scheduled('wati_cleanup_old_logs')) {
+        wp_schedule_event(time(), 'daily', 'wati_cleanup_old_logs');
+        error_log('WATI Debug: Log cleanup cron job scheduled successfully');
+    }
 }
 
 // Add custom cron interval
@@ -1217,7 +1231,7 @@ function send_wati_template($phone_number, $template_name, $variables = array())
     }
     
     // Check both emergency stop and stop signal - immediate check
-    if (wati_check_emergency_stop() || wati_check_stop_signal()) {
+    if (wati_check_emergency_stop(true) || wati_check_stop_signal()) {
         error_log('WATI Debug: Message sending stopped due to emergency stop/signal. Phone: ' . $phone_number);
         return false;
     }
@@ -1286,6 +1300,14 @@ function send_wati_template($phone_number, $template_name, $variables = array())
     // One final emergency stop check before API call - critical point
     if (wati_check_emergency_stop(true) || wati_check_stop_signal()) {
         error_log('WATI Debug: Emergency stop detected right before API call. Aborting send to: ' . $phone_number);
+        return false;
+    }
+
+    // Short-term de-duplication guard (10 minutes) to avoid repeated sends in bursts
+    $dedupe_key = 'wati_dedupe_' . md5($whatsapp_number . '|' . $template_name);
+    $dedupe_hit = get_transient($dedupe_key);
+    if ($dedupe_hit) {
+        error_log('WATI Debug: Dedupe guard prevented duplicate send for ' . $whatsapp_number . ' template ' . $template_name);
         return false;
     }
 
@@ -1363,6 +1385,8 @@ function send_wati_template($phone_number, $template_name, $variables = array())
     if ($success) {
         // Clear retry count on success
         delete_option($retry_key);
+        // Set dedupe guard for 10 minutes
+        set_transient($dedupe_key, 1, 10 * MINUTE_IN_SECONDS);
         error_log('WATI Debug: Message sent successfully');
     } else {
         // Increment retry count on failure
@@ -1397,7 +1421,10 @@ function send_wati_template($phone_number, $template_name, $variables = array())
 // Check notifications function (runs every 5 minutes)
 function wati_check_notifications() {
     // Force terminate if emergency stop is active
-    wati_force_terminate_if_emergency();
+    if (wati_check_emergency_stop(true) || wati_check_stop_signal()) {
+        // No further logs here to avoid noise when emergency is active
+        return;
+    }
     
     // First check if plugin is still active
     if (!wati_is_plugin_active()) {
@@ -1408,10 +1435,7 @@ function wati_check_notifications() {
     }
     
     // Check for emergency stop before processing any notifications
-    if (wati_check_emergency_stop() || wati_check_stop_signal()) {
-        error_log('WATI Debug: Skipping notification check due to active emergency stop');
-        return;
-    }
+    if (wati_check_emergency_stop() || wati_check_stop_signal()) { return; }
 
     if (!wati_rate_limit_check()) {
         error_log('WATI Debug: Rate limit hit - skipping this run');
@@ -1597,6 +1621,7 @@ function check_abandoned_carts($settings, $is_test = false) {
     $details['total_carts'] = count($abandoned_carts);
 
     foreach ($abandoned_carts as $cart) {
+    if (wati_check_emergency_stop(true) || wati_check_stop_signal()) { break; }
         // Check if plugin is still active before processing each cart
         if (!wati_is_plugin_active() && !$is_test) {
             error_log('WATI Debug: Plugin is no longer active during abandoned cart check. Stopping processing.');
@@ -1634,6 +1659,22 @@ function check_abandoned_carts($settings, $is_test = false) {
             continue;
         }
 
+        // 7-day dedupe by email/phone + template
+        $template_name = $condition['template_name'];
+        $normalized_phone = preg_replace('/[^0-9]/', '', $phone);
+        $normalized_email = strtolower(trim((string)$cart->email));
+        $email_dedupe_key = $normalized_email ? 'wati_dedupe_ac_email_' . md5($normalized_email . '|' . $template_name) : '';
+        $phone_dedupe_key = $normalized_phone ? 'wati_dedupe_ac_phone_' . md5($normalized_phone . '|' . $template_name) : '';
+        $deduped_recently = false;
+        if ($email_dedupe_key && get_transient($email_dedupe_key)) { $deduped_recently = true; }
+        if ($phone_dedupe_key && get_transient($phone_dedupe_key)) { $deduped_recently = true; }
+        if ($deduped_recently) {
+            $cart_info['status'] = 'already_notified';
+            $details['already_notified']++;
+            $details['found_carts'][] = $cart_info;
+            continue;
+        }
+
         $cart_info['status'] = 'eligible';
         $cart_info['phone'] = $phone;
         $cart_info['customer_name'] = $other_fields['wcf_first_name'] ?? '';
@@ -1648,10 +1689,39 @@ function check_abandoned_carts($settings, $is_test = false) {
                 }
             }
 
-            // Actual sending logic
-            if (send_wati_template($phone, $condition['template_name'], $variables)) {
+            // Build variables for abandoned cart send if defined
+            $variables = array();
+            foreach ($settings['conditions']['abandoned']['variables'] as $var) {
+                switch ($var['type']) {
+                    case 'customer_name':
+                        $variables[] = array(
+                            'name' => $var['template_name'],
+                            'value' => $other_fields['wcf_first_name'] ?? ''
+                        );
+                        break;
+                    case 'order_number':
+                        $variables[] = array(
+                            'name' => $var['template_name'],
+                            'value' => $cart->id
+                        );
+                        break;
+                }
+            }
+
+            // Lock per cart to avoid concurrency duplicates
+            $lock_key = 'wati_lock_cart_' . $cart->id;
+            if (!wati_acquire_lock($lock_key, 1800)) { // 30 min TTL
+                error_log('WATI Debug: Could not acquire lock for cart ' . $cart->id . ', skipping to avoid duplicate');
+            } else {
+                // Actual sending logic
+                if (send_wati_template($phone, $condition['template_name'], $variables)) {
                 update_option($notification_key, current_time('mysql'), false);
                 $cart_info['notification_sent'] = true;
+                    // Set 7-day dedupe keys
+                    if ($email_dedupe_key) { set_transient($email_dedupe_key, 1, 7 * DAY_IN_SECONDS); }
+                    if ($phone_dedupe_key) { set_transient($phone_dedupe_key, 1, 7 * DAY_IN_SECONDS); }
+                }
+                wati_release_lock($lock_key);
             }
         }
 
@@ -1696,7 +1766,14 @@ function check_processing_orders($settings, $is_test = false) {
         $order_ids = $filtered_order_ids;
     }
 
+    // Compute optional delay
+    $condition = $settings['conditions']['processing'];
+    $delay_minutes = isset($condition['delay_time'])
+        ? (($condition['delay_unit'] ?? 'hours') === 'hours' ? (int)$condition['delay_time'] * 60 : (int)$condition['delay_time'])
+        : 0;
+
     foreach ($order_ids as $order_id) {
+    if (wati_check_emergency_stop(true) || wati_check_stop_signal()) { break; }
         $order = wc_get_order($order_id);
         if (!$order) continue;
 
@@ -1711,6 +1788,15 @@ function check_processing_orders($settings, $is_test = false) {
             'customer_id' => $order->get_customer_id()
         );
 
+        // Ensure current status is still processing (guard against race where status changed to shipped/completed)
+        $current_status = $order->get_status();
+        if ($current_status !== 'processing') {
+            // Skip if not processing anymore
+            $order_info['status'] = 'status_changed';
+            $details['found_orders'][] = $order_info;
+            continue;
+        }
+
         if (get_option($notification_key)) {
             $order_info['status'] = 'already_notified';
             $details['already_notified']++;
@@ -1723,10 +1809,27 @@ function check_processing_orders($settings, $is_test = false) {
             continue;
         }
 
+        // Respect configured delay: wait until modified time + delay
+        $is_ready = true;
+        if (!$is_test && $delay_minutes > 0) {
+            $status_changed_ts = $order->get_date_modified() ? $order->get_date_modified()->getTimestamp() : time();
+            $time_diff = time() - $status_changed_ts;
+            if ($time_diff < ($delay_minutes * 60)) {
+                $is_ready = false;
+            }
+        }
+
+        if (!$is_ready) {
+            // Not ready to notify yet
+            $order_info['status'] = 'waiting_delay';
+            $details['found_orders'][] = $order_info;
+            continue;
+        }
+
         $order_info['status'] = 'eligible';
         $details['eligible_orders']++;
         
-        if (!$is_test) {
+    if (!$is_test) {
             // Add random delay before sending if not the first message
             if ($details['eligible_orders'] > 0) {
                 // If wati_random_delay returns false, plugin is not active anymore
@@ -1772,9 +1875,23 @@ function check_processing_orders($settings, $is_test = false) {
                 }
             }
 
-            if (send_wati_template($order->get_billing_phone(), $settings['conditions']['processing']['template_name'], $variables)) {
-                update_option($notification_key, current_time('mysql'), false);
-                $order_info['notification_sent'] = true;
+            // Guard: re-check status just before sending
+            $order = wc_get_order($order_id);
+            if (!$order || $order->get_status() !== 'processing') {
+                error_log('WATI Debug: Processing status re-check failed for order ' . $order_id . ', skipping send');
+                break;
+            }
+
+            // Lock per order to avoid concurrency duplicates
+            $lock_key = 'wati_lock_order_processing_' . $order_id;
+            if (!wati_acquire_lock($lock_key, 1800)) {
+                error_log('WATI Debug: Could not acquire processing lock for order ' . $order_id);
+            } else {
+                if (send_wati_template($order->get_billing_phone(), $settings['conditions']['processing']['template_name'], $variables)) {
+                    update_option($notification_key, current_time('mysql'), false);
+                    $order_info['notification_sent'] = true;
+                }
+                wati_release_lock($lock_key);
             }
         }
 
@@ -1818,6 +1935,7 @@ function check_shipped_orders($settings, $is_test = false) {
     // Process orders in batches
     wati_process_orders_in_batches($order_ids, function($batch) use (&$details, $settings, $is_test, $delay_minutes) {
         foreach ($batch as $order_id) {
+            if (wati_check_emergency_stop(true) || wati_check_stop_signal()) { return; }
             try {
                 $order = wc_get_order($order_id);
                 if (!$order || $order->get_type() === 'shop_order_refund') {
@@ -1928,12 +2046,25 @@ function check_shipped_orders($settings, $is_test = false) {
                 error_log("WATI Debug: Template: " . $settings['conditions']['shipped']['template_name']);
                 error_log("WATI Debug: Variables: " . print_r($variables, true));
 
-                if (send_wati_template($order->get_billing_phone(), $settings['conditions']['shipped']['template_name'], $variables)) {
-                    update_option($notification_key, current_time('mysql'), false);
-                    $order_info['notification_sent'] = true;
-                    error_log("WATI Debug: Successfully sent notification for order {$order_id}");
+                // Guard: re-check status right before sending
+                $order = wc_get_order($order_id);
+                if (!$order || !in_array($order->get_status(), array('completed', 'shipped'))) {
+                    error_log("WATI Debug: Status re-check failed for order {$order_id}, skipping send");
                 } else {
-                    error_log("WATI Debug: Failed to send notification for order {$order_id}");
+                // Lock per order to avoid concurrency duplicates
+                $lock_key = 'wati_lock_order_shipped_' . $order_id;
+                if (!wati_acquire_lock($lock_key, 1800)) {
+                    error_log('WATI Debug: Could not acquire shipped lock for order ' . $order_id);
+                } else {
+                    if (send_wati_template($order->get_billing_phone(), $settings['conditions']['shipped']['template_name'], $variables)) {
+                        update_option($notification_key, current_time('mysql'), false);
+                        $order_info['notification_sent'] = true;
+                        error_log("WATI Debug: Successfully sent notification for order {$order_id}");
+                    } else {
+                        error_log("WATI Debug: Failed to send notification for order {$order_id}");
+                    }
+                    wati_release_lock($lock_key);
+                }
                 }
             }
 
@@ -2011,6 +2142,13 @@ function wati_notification_logs_page_html() {
                 <?php wp_nonce_field('wati_clear_logs'); ?>
                 <input type="submit" name="clear_logs" class="button" value="Clear Logs">
             </form>
+            <div style="float: left; margin-right: 10px; display:flex; align-items:center; gap:8px;">
+                <button type="button" id="refresh-logs" class="button">Refresh Logs</button>
+                <span id="refresh-status" style="display:none;">
+                    <span class="spinner is-active"></span>
+                    <span>Refreshing…</span>
+                </span>
+            </div>
             
             <div class="alignright">
                 <select id="log-type-filter">
@@ -2030,7 +2168,7 @@ function wati_notification_logs_page_html() {
             </div>
         </div>
 
-        <table class="wp-list-table widefat fixed striped">
+    <table id="wati-logs-table" class="wp-list-table widefat fixed striped">
             <thead>
                 <tr>
                     <th>Details</th>
@@ -2166,8 +2304,10 @@ function wati_notification_logs_page_html() {
 
     <script>
     jQuery(document).ready(function($) {
-        // Show/hide details
-        $('.show-details').click(function() {
+        const fetchNonce = '<?php echo wp_create_nonce('wati_fetch_logs'); ?>';
+
+        // Show/hide details (delegated for dynamic rows)
+        $(document).on('click', '.show-details', function() {
             $(this).siblings('.log-details').toggle();
             $(this).text($(this).text() === 'Show Details' ? 'Hide Details' : 'Show Details');
         });
@@ -2182,6 +2322,124 @@ function wati_notification_logs_page_html() {
                 $('.log-entry').show();
             }
         });
+        // Refresh logs
+        $('#refresh-logs').on('click', function() {
+            const btn = $(this);
+            const status = $('#refresh-status');
+            btn.prop('disabled', true);
+            status.show();
+            $.post(ajaxurl, {
+                action: 'wati_fetch_logs',
+                nonce: fetchNonce
+            }).done(function(response) {
+                if (response.success) {
+                    const logs = response.data.logs || [];
+                    const rowsHtml = buildRowsHtml(logs);
+                    $('#wati-logs-table tbody').html(rowsHtml);
+                    // Re-apply current filter selection
+                    $('#log-type-filter').trigger('change');
+                } else {
+                    alert('Failed to fetch logs: ' + (response.data && response.data.message ? response.data.message : 'Unknown error'));
+                }
+            }).fail(function() {
+                alert('Failed to fetch logs: Server error');
+            }).always(function() {
+                btn.prop('disabled', false);
+                status.hide();
+            });
+        });
+
+        function buildRowsHtml(logs) {
+            let html = '';
+            if (!logs.length) {
+                html += '<tr><td colspan="7">No logs found.</td></tr>';
+                return html;
+            }
+            // Show newest first like original (array_reverse)
+            const items = logs.slice().reverse();
+            items.forEach(log => {
+                const type = esc(log.type || '');
+                const time = esc(log.time || '');
+                const phone = esc(log.phone || '');
+                const template = esc(log.template || '');
+                const status = esc(log.status || '');
+                const details = log.details || {};
+                const orderId = extractOrderId(details);
+                html += `
+                    <tr class="log-entry" data-type="${type}">
+                        <td>
+                            <button type="button" class="button show-details">Show Details</button>
+                            <div class="log-details" style="display: none;">
+                                <div class="log-details-content">${renderDetails(details)}</div>
+                            </div>
+                        </td>
+                        <td>${time}</td>
+                        <td>${capitalize(type)}</td>
+                        <td>${phone}</td>
+                        <td>${template}</td>
+                        <td><span class="status-badge status-${status}">${capitalize(status)}</span></td>
+                        <td>${esc(orderId)}</td>
+                    </tr>
+                `;
+            });
+            return html;
+        }
+
+        function extractOrderId(details) {
+            if (!details || typeof details !== 'object') return '';
+            if (details.order_id) return String(details.order_id);
+            if (details.cart_id) return String(details.cart_id);
+            if (Array.isArray(details.parameters)) {
+                for (const p of details.parameters) {
+                    if (p && p.name === 'order_number') return String(p.value);
+                }
+            }
+            return '';
+        }
+
+        function renderDetails(details) {
+            if (!details || typeof details !== 'object') return '';
+            let out = '';
+            for (const key in details) {
+                if (!Object.prototype.hasOwnProperty.call(details, key)) continue;
+                const label = capitalize(key.replace(/_/g, ' '));
+                const value = details[key];
+                if (Array.isArray(value)) {
+                    if (key === 'parameters' || key === 'variables') {
+                        out += '<div class="detail-row"><strong>' + esc(label) + ':</strong><br><div class="parameters-list">';
+                        value.forEach(param => {
+                            if (!param) return;
+                            out += '<div class="parameter-item">' +
+                                   '<span class="param-name">' + esc(param.name || '') + ':</span> ' +
+                                   '<span class="param-value">' + esc(String(param.value || '')) + '</span>' +
+                                   '</div>';
+                        });
+                        out += '</div></div>';
+                    } else {
+                        out += '<div class="detail-row"><strong>' + esc(label) + ':</strong><pre>' + esc(JSON.stringify(value, null, 2)) + '</pre></div>';
+                    }
+                } else if (value && typeof value === 'object') {
+                    out += '<div class="detail-row"><strong>' + esc(label) + ':</strong><pre>' + esc(JSON.stringify(value, null, 2)) + '</pre></div>';
+                } else {
+                    out += '<div class="detail-row"><strong>' + esc(label) + ':</strong> ' + esc(String(value)) + '</div>';
+                }
+            }
+            return out;
+        }
+
+        function esc(str) {
+            return String(str)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#039;');
+        }
+
+        function capitalize(s) {
+            s = String(s || '');
+            return s.charAt(0).toUpperCase() + s.slice(1);
+        }
     });
     </script>
     <?php
@@ -2189,8 +2447,12 @@ function wati_notification_logs_page_html() {
 
 // Update the logging function to include automatic cleanup
 function wati_log_notification($type, $phone, $template, $status, $details = array()) {
+    // Suppress non-emergency logs during emergency stop
+    if ($type !== 'emergency' && wati_check_emergency_stop()) {
+        return;
+    }
     $logs = get_option('wati_notification_logs', array());
-    $one_week_ago = strtotime('-1 week');
+    $cutoff_ts = time() - (WATI_LOG_RETENTION_DAYS * DAY_IN_SECONDS);
     
     // Add new log
     $logs[] = array(
@@ -2202,14 +2464,14 @@ function wati_log_notification($type, $phone, $template, $status, $details = arr
         'details' => $details
     );
 
-    // Filter out logs older than one week
-    $logs = array_filter($logs, function($log) use ($one_week_ago) {
-        return strtotime($log['time']) > $one_week_ago;
+    // Filter out logs older than retention window
+    $logs = array_filter($logs, function($log) use ($cutoff_ts) {
+        return strtotime($log['time']) > $cutoff_ts;
     });
 
-    // Keep only last 1000 logs even if they're within a week
-    if (count($logs) > 1000) {
-        $logs = array_slice($logs, -1000);
+    // Enforce max entries cap
+    if (count($logs) > WATI_LOG_MAX_ENTRIES) {
+        $logs = array_slice($logs, -WATI_LOG_MAX_ENTRIES);
     }
 
     update_option('wati_notification_logs', array_values($logs));
@@ -2228,12 +2490,12 @@ function wati_cleanup_old_logs() {
     error_log('WATI Debug: Starting scheduled log cleanup');
     
     $logs = get_option('wati_notification_logs', array());
-    $one_week_ago = strtotime('-1 week');
+    $cutoff_ts = time() - (WATI_LOG_RETENTION_DAYS * DAY_IN_SECONDS);
     $original_count = count($logs);
     
     // Filter out old logs
-    $logs = array_filter($logs, function($log) use ($one_week_ago) {
-        return strtotime($log['time']) > $one_week_ago;
+    $logs = array_filter($logs, function($log) use ($cutoff_ts) {
+        return strtotime($log['time']) > $cutoff_ts;
     });
     
     $removed_count = $original_count - count($logs);
@@ -2698,6 +2960,17 @@ function wati_add_test_button() {
     <?php
 }
 
+// AJAX: Fetch logs for refresh button
+add_action('wp_ajax_wati_fetch_logs', 'wati_fetch_logs_ajax');
+function wati_fetch_logs_ajax() {
+    check_ajax_referer('wati_fetch_logs', 'nonce');
+    if (!current_user_can('manage_options')) {
+        wp_send_json_error(array('message' => 'Unauthorized'), 403);
+    }
+    $logs = get_option('wati_notification_logs', array());
+    wp_send_json_success(array('logs' => $logs));
+}
+
 // Add this new function
 function check_discount_notifications($settings, $is_test = false) {
     global $wpdb;
@@ -2755,6 +3028,7 @@ function check_discount_notifications($settings, $is_test = false) {
     );
 
     foreach ($eligible_carts as $cart) {
+    if (wati_check_emergency_stop(true) || wati_check_stop_signal()) { break; }
         error_log('WATI Debug: Processing discount reminder for cart ID ' . $cart->id);
 
         $other_fields = maybe_unserialize($cart->other_fields);
@@ -2763,6 +3037,29 @@ function check_discount_notifications($settings, $is_test = false) {
         if (empty($phone)) {
             error_log('WATI Debug: No phone number for cart ' . $cart->id);
             $details['no_phone']++;
+            continue;
+        }
+
+        // 7-day dedupe for discount by email/phone + template
+        $template_name = $condition['template_name'];
+        $normalized_phone = preg_replace('/[^0-9]/', '', $phone);
+        $normalized_email = strtolower(trim((string)$cart->email));
+        $email_dedupe_key = $normalized_email ? 'wati_dedupe_discount_email_' . md5($normalized_email . '|' . $template_name) : '';
+        $phone_dedupe_key = $normalized_phone ? 'wati_dedupe_discount_phone_' . md5($normalized_phone . '|' . $template_name) : '';
+        $deduped_recently = false;
+        if ($email_dedupe_key && get_transient($email_dedupe_key)) { $deduped_recently = true; }
+        if ($phone_dedupe_key && get_transient($phone_dedupe_key)) { $deduped_recently = true; }
+        if ($deduped_recently) {
+            error_log('WATI Debug: Discount dedupe hit for cart ' . $cart->id);
+            // Treat as already notified for summary purposes
+            $details['already_notified'] = ($details['already_notified'] ?? 0) + 1;
+            $details['found_carts'][] = array(
+                'id' => $cart->id,
+                'email' => $cart->email,
+                'time' => $cart->time,
+                'cart_total' => $cart->cart_total,
+                'status' => 'already_notified'
+            );
             continue;
         }
 
@@ -2811,7 +3108,7 @@ function check_discount_notifications($settings, $is_test = false) {
 
         $details['eligible_carts']++;
         
-        if (!$is_test) {
+    if (!$is_test) {
             // Add random delay before sending if not the first message
             if ($details['eligible_carts'] > 0) {
                 // If wati_random_delay returns false, plugin is not active anymore
@@ -2820,24 +3117,34 @@ function check_discount_notifications($settings, $is_test = false) {
                 }
             }
 
-            if (send_wati_template($phone, $condition['template_name'], $variables)) {
-                error_log('WATI Debug: Successfully sent discount reminder for cart ' . $cart->id);
-                update_option('wati_discount_' . $cart->id, current_time('mysql'), false);
-                
-                // Log the discount notification
-                wati_log_notification('discount', $phone, $condition['template_name'], 'success', array(
-                    'cart_id' => $cart->id,
-                    'delay_minutes' => $delay_minutes,
-                    'variables' => $variables
-                ));
+        // Lock per cart to avoid concurrency duplicates
+            $lock_key = 'wati_lock_cart_discount_' . $cart->id;
+            if (!wati_acquire_lock($lock_key, 1800)) {
+                error_log('WATI Debug: Could not acquire discount lock for cart ' . $cart->id);
             } else {
-                error_log('WATI Debug: Failed to send discount reminder for cart ' . $cart->id);
-                
-                // Log the failure
-                wati_log_notification('discount', $phone, $condition['template_name'], 'error', array(
-                    'cart_id' => $cart->id,
-                    'error' => 'Failed to send discount reminder'
-                ));
+                if (send_wati_template($phone, $condition['template_name'], $variables)) {
+                    error_log('WATI Debug: Successfully sent discount reminder for cart ' . $cart->id);
+                    update_option('wati_discount_' . $cart->id, current_time('mysql'), false);
+            // Set 7-day dedupe keys
+            if ($email_dedupe_key) { set_transient($email_dedupe_key, 1, 7 * DAY_IN_SECONDS); }
+            if ($phone_dedupe_key) { set_transient($phone_dedupe_key, 1, 7 * DAY_IN_SECONDS); }
+                    
+                    // Log the discount notification
+                    wati_log_notification('discount', $phone, $condition['template_name'], 'success', array(
+                        'cart_id' => $cart->id,
+                        'delay_minutes' => $delay_minutes,
+                        'variables' => $variables
+                    ));
+                } else {
+                    error_log('WATI Debug: Failed to send discount reminder for cart ' . $cart->id);
+                    
+                    // Log the failure
+                    wati_log_notification('discount', $phone, $condition['template_name'], 'error', array(
+                        'cart_id' => $cart->id,
+                        'error' => 'Failed to send discount reminder'
+                    ));
+                }
+                wati_release_lock($lock_key);
             }
         }
 
@@ -2956,6 +3263,7 @@ function check_custom_notifications($settings, $is_test = false) {
     }
 
     foreach ($order_ids as $order_id) {
+    if (wati_check_emergency_stop(true) || wati_check_stop_signal()) { break; }
         $order = wc_get_order($order_id);
         if (!$order) continue;
 
@@ -3172,7 +3480,7 @@ function check_tracking_notifications($settings, $is_test = false) {
         $order_info['status'] = 'eligible';
         $details['eligible_orders']++;
         
-        if (!$is_test) {
+    if (!$is_test) {
             // Add random delay before sending if not the first message
             if ($details['eligible_orders'] > 1) {
                 // If wati_random_delay returns false, plugin is not active anymore
@@ -3220,12 +3528,19 @@ function check_tracking_notifications($settings, $is_test = false) {
             error_log("WATI Debug: Attempting to send tracking notification for order {$order_id}");
             error_log("WATI Debug: Template: " . $settings['conditions']['tracking']['template_name']);
 
-            if (send_wati_template($order->get_billing_phone(), $settings['conditions']['tracking']['template_name'], $variables)) {
-                update_option($notification_key, current_time('mysql'), false);
-                $order_info['notification_sent'] = true;
-                error_log("WATI Debug: Successfully sent tracking notification for order {$order_id}");
+            // Lock per order to avoid concurrency duplicates
+            $lock_key = 'wati_lock_order_tracking_' . $order_id;
+            if (!wati_acquire_lock($lock_key, 1800)) {
+                error_log('WATI Debug: Could not acquire tracking lock for order ' . $order_id);
             } else {
-                error_log("WATI Debug: Failed to send tracking notification for order {$order_id}");
+                if (send_wati_template($order->get_billing_phone(), $settings['conditions']['tracking']['template_name'], $variables)) {
+                    update_option($notification_key, current_time('mysql'), false);
+                    $order_info['notification_sent'] = true;
+                    error_log("WATI Debug: Successfully sent tracking notification for order {$order_id}");
+                } else {
+                    error_log("WATI Debug: Failed to send tracking notification for order {$order_id}");
+                }
+                wati_release_lock($lock_key);
             }
         }
 
@@ -3279,54 +3594,50 @@ function wati_rate_limit_check() {
     return true;
 }
 
+// Simple lock helpers to prevent duplicate sends due to concurrent processes
+function wati_acquire_lock($lock_key, $ttl = 900) { // default 15 minutes
+    $now = time();
+    // Try to create the lock atomically
+    if (add_option($lock_key, $now, '', 'no')) {
+        return true;
+    }
+    // If it exists and is stale, clear and retry once
+    $existing = get_option($lock_key);
+    if ($existing && is_numeric($existing) && ($now - intval($existing)) > $ttl) {
+        delete_option($lock_key);
+        if (add_option($lock_key, $now, '', 'no')) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function wati_release_lock($lock_key) {
+    delete_option($lock_key);
+}
+
 function wati_emergency_stop() {
     global $wpdb;
     
     error_log('WATI Debug: Emergency stop activated for WATI notifications by process ' . getmypid());
     
-    // Store process ID and timestamp
+    // Single source of truth: option only
     $emergency_data = array(
         'active' => true,
         'timestamp' => current_time('mysql'),
         'process_id' => getmypid()
     );
-    
-    // Set both transient and option for redundancy with serialized value for consistency
-    $serialized_data = serialize($emergency_data);
-    
-    // Direct DB writes to ensure they happen immediately
-    $wpdb->query($wpdb->prepare(
-        "INSERT INTO {$wpdb->options} (option_name, option_value, autoload) 
-         VALUES (%s, %s, %s) 
-         ON DUPLICATE KEY UPDATE option_value = %s",
-        'wati_emergency_stop', $serialized_data, 'yes', $serialized_data
-    ));
-    
-    $wpdb->query($wpdb->prepare(
-        "INSERT INTO {$wpdb->options} (option_name, option_value, autoload) 
-         VALUES (%s, %s, %s) 
-         ON DUPLICATE KEY UPDATE option_value = %s",
-        '_transient_wati_emergency_stop', $serialized_data, 'no', $serialized_data
-    ));
-    
-    // Also write to options API for redundancy
     update_option('wati_emergency_stop', $emergency_data, 'yes');
-    set_transient('wati_emergency_stop', $emergency_data, 12 * HOUR_IN_SECONDS);
-    
+
     // Set stop signal with current timestamp
-    $wpdb->query($wpdb->prepare(
-        "INSERT INTO {$wpdb->options} (option_name, option_value, autoload) 
-         VALUES (%s, %s, %s) 
-         ON DUPLICATE KEY UPDATE option_value = %s",
-        'wati_notification_stop_signal', current_time('mysql'), 'yes', current_time('mysql')
-    ));
+    update_option('wati_notification_stop_signal', current_time('mysql'), 'yes');
     
     // Try to stop only WATI notification processes
     wati_terminate_notification_processes();
     
     // Force kill any remaining WATI processes
     wati_kill_notification_processes();
-
+ 
     // Clear any pending WATI notifications
     delete_option('wati_pending_notifications');
     
@@ -3336,6 +3647,10 @@ function wati_emergency_stop() {
     // Reset retry counters
     wati_reset_retry_counts();
     
+    // Unschedule all related crons immediately to enforce hard stop
+    wp_clear_scheduled_hook('wati_check_notifications');
+    wp_clear_scheduled_hook('wati_cleanup_old_logs');
+
     // Log the emergency stop with detailed information
     wati_log_notification('emergency', '', '', 'warning', array(
         'message' => 'Emergency stop activated for WATI notifications',
@@ -3349,57 +3664,21 @@ function wati_emergency_stop() {
 function wati_check_emergency_stop($bypass_cache = false) {
     global $wpdb;
     
-    // If bypass_cache is true, directly check the database
+    // Always use the option as single source of truth
     if ($bypass_cache) {
-        $option_value = $wpdb->get_var("
-            SELECT option_value FROM {$wpdb->options} 
-            WHERE option_name = 'wati_emergency_stop' 
-            LIMIT 1
-        ");
-        
+        $option_value = $wpdb->get_var(
+            "SELECT option_value FROM {$wpdb->options} WHERE option_name = 'wati_emergency_stop' LIMIT 1"
+        );
         if ($option_value) {
             $emergency_stop = maybe_unserialize($option_value);
-            if (is_array($emergency_stop) && isset($emergency_stop['active']) && $emergency_stop['active']) {
-                error_log('WATI Debug: Emergency stop check (DB direct) - Stop is active');
-                return true;
-            }
+            return is_array($emergency_stop) && !empty($emergency_stop['active']);
         }
-        
-        // Also check the transient directly for thoroughness
-        $transient_value = $wpdb->get_var("
-            SELECT option_value FROM {$wpdb->options} 
-            WHERE option_name = '_transient_wati_emergency_stop' 
-            LIMIT 1
-        ");
-        
-        if ($transient_value) {
-            $transient_stop = maybe_unserialize($transient_value);
-            if (is_array($transient_stop) && isset($transient_stop['active']) && $transient_stop['active']) {
-                error_log('WATI Debug: Emergency stop check (transient DB direct) - Stop is active');
-                return true;
-            }
-        }
-        
         return false;
     }
-    
-    // Standard check for normal operation (cached)
-    // Check transient first (faster)
-    $emergency_stop = get_transient('wati_emergency_stop');
-    
-    // If no transient, check option
-    if (false === $emergency_stop) {
-        $emergency_stop = get_option('wati_emergency_stop', false);
-    }
-    
-    // If emergency stop is active, log it
-    if (is_array($emergency_stop) && isset($emergency_stop['active']) && $emergency_stop['active']) {
-        error_log('WATI Debug: Emergency stop check - Stop is active (set by process ' . 
-            (isset($emergency_stop['process_id']) ? $emergency_stop['process_id'] : 'unknown') . 
-            ' at ' . $emergency_stop['timestamp'] . ')');
+    $emergency_stop = get_option('wati_emergency_stop', false);
+    if (is_array($emergency_stop) && !empty($emergency_stop['active'])) {
         return true;
     }
-    
     return false;
 }
 
@@ -3679,9 +3958,12 @@ function wati_emergency_stop_disable() {
         ));
     }
     
-    // Clear emergency stop flags
+    // Clear emergency stop flags (option only) and wipe any legacy transient rows
     delete_option('wati_emergency_stop');
     delete_transient('wati_emergency_stop');
+    // Force delete any transient rows left behind
+    $wpdb->query("DELETE FROM {$wpdb->options} WHERE option_name = '_transient_wati_emergency_stop'");
+    $wpdb->query("DELETE FROM {$wpdb->options} WHERE option_name = '_transient_timeout_wati_emergency_stop'");
     
     // Clear stop signal
     delete_option('wati_notification_stop_signal');
@@ -3692,6 +3974,9 @@ function wati_emergency_stop_disable() {
     // Reset retry counters
     wati_reset_retry_counts();
     
+    // Reschedule crons after disabling emergency
+    wati_schedule_cron_jobs();
+
     // Log the deactivation
     wati_log_notification('emergency', '', '', 'info', array(
         'message' => 'Emergency stop deactivated',
