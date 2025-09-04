@@ -1426,19 +1426,31 @@ function wati_check_notifications() {
         return;
     }
     
+    // Global lock to prevent concurrent executions
+    $global_lock_key = 'wati_global_cron_lock';
+    if (!wati_acquire_lock($global_lock_key, 1800)) { // 30 minutes TTL
+        error_log('WATI Debug: Another cron instance is running. Skipping this execution.');
+        return;
+    }
+    
     // First check if plugin is still active
     if (!wati_is_plugin_active()) {
         error_log('WATI Debug: Plugin is not active. Terminating notification check.');
         // Clear processing state
         delete_option('wati_notification_processing');
+        wati_release_lock($global_lock_key);
         return;
     }
     
     // Check for emergency stop before processing any notifications
-    if (wati_check_emergency_stop() || wati_check_stop_signal()) { return; }
+    if (wati_check_emergency_stop() || wati_check_stop_signal()) { 
+        wati_release_lock($global_lock_key);
+        return; 
+    }
 
     if (!wati_rate_limit_check()) {
         error_log('WATI Debug: Rate limit hit - skipping this run');
+        wati_release_lock($global_lock_key);
         return;
     }
     
@@ -1452,6 +1464,20 @@ function wati_check_notifications() {
             date('Y-m-d H:i:s', wp_next_scheduled('wati_check_notifications')) : 'Not scheduled'
     ));
     
+    // Check for and clear stale emergency stops (older than 1 hour)
+    $emergency_stop = get_option('wati_emergency_stop', false);
+    if (is_array($emergency_stop) && !empty($emergency_stop['active'])) {
+        $emergency_time = isset($emergency_stop['timestamp']) ? strtotime($emergency_stop['timestamp']) : 0;
+        if ($emergency_time && (time() - $emergency_time) > 3600) { // 1 hour
+            error_log('WATI Debug: Clearing stale emergency stop (older than 1 hour)');
+            delete_option('wati_emergency_stop');
+            wati_log_notification('emergency', '', '', 'info', array(
+                'message' => 'Stale emergency stop cleared automatically',
+                'emergency_age_hours' => round((time() - $emergency_time) / 3600, 2)
+            ));
+        }
+    }
+
     // Get settings
     $settings = get_option('wati_notifications_settings', array());
     
@@ -1460,6 +1486,7 @@ function wati_check_notifications() {
         wati_log_notification('cron', '', '', 'warning', array(
             'message' => 'Feature is disabled in settings'
         ));
+        wati_release_lock($global_lock_key);
         return;
     }
 
@@ -1477,6 +1504,7 @@ function wati_check_notifications() {
         if (!empty($settings['conditions']['tracking']['enabled'])) {
             if (wati_check_emergency_stop(true) || wati_check_stop_signal()) {
                 error_log('WATI Debug: Emergency stop active - stopping tracking notifications');
+                wati_release_lock($global_lock_key);
                 return;
             }
             
@@ -1512,6 +1540,7 @@ function wati_check_notifications() {
             
             if (wati_check_emergency_stop(true) || wati_check_stop_signal()) {
                 error_log("WATI Debug: Emergency stop active - stopping {$type} notifications");
+                wati_release_lock($global_lock_key);
                 return;
             }
             
@@ -1535,7 +1564,8 @@ function wati_check_notifications() {
             // Check for emergency stop after each notification type
             if (wati_check_emergency_stop(true) || wati_check_stop_signal()) {
                 error_log("WATI Debug: Emergency stop detected after {$type} check. Stopping remaining checks.");
-                break;
+                wati_release_lock($global_lock_key);
+                return;
             }
         }
 
@@ -1546,6 +1576,8 @@ function wati_check_notifications() {
     } finally {
         // Clear the processing flag
         delete_option('wati_notification_processing');
+        // Release the global lock
+        wati_release_lock($global_lock_key);
     }
 }
 add_action('wati_check_notifications', 'wati_check_notifications');
@@ -1797,9 +1829,22 @@ function check_processing_orders($settings, $is_test = false) {
             continue;
         }
 
-        if (get_option($notification_key)) {
+        // Enhanced duplicate prevention with timestamp check
+        $existing_notification = get_option($notification_key);
+        if ($existing_notification) {
+            // Check if notification was sent recently (within last 24 hours)
+            $notification_time = is_string($existing_notification) ? strtotime($existing_notification) : time();
+            $hours_since_notification = (time() - $notification_time) / 3600;
+            
             $order_info['status'] = 'already_notified';
+            $order_info['notified_at'] = $existing_notification;
+            $order_info['hours_ago'] = round($hours_since_notification, 1);
             $details['already_notified']++;
+            
+            // Log for safety verification
+            if ($hours_since_notification < 24) {
+                error_log("WATI Debug: Order {$order_id} already notified {$hours_since_notification} hours ago - SKIPPING to prevent duplicate");
+            }
             continue;
         }
 
@@ -1886,12 +1931,23 @@ function check_processing_orders($settings, $is_test = false) {
             $lock_key = 'wati_lock_order_processing_' . $order_id;
             if (!wati_acquire_lock($lock_key, 1800)) {
                 error_log('WATI Debug: Could not acquire processing lock for order ' . $order_id);
+                $order_info['status'] = 'locked_by_another_process';
             } else {
-                if (send_wati_template($order->get_billing_phone(), $settings['conditions']['processing']['template_name'], $variables)) {
-                    update_option($notification_key, current_time('mysql'), false);
-                    $order_info['notification_sent'] = true;
+                // Double-check notification key after acquiring lock
+                if (get_option($notification_key)) {
+                    error_log('WATI Debug: Order ' . $order_id . ' already notified (double-check after lock)');
+                    $order_info['status'] = 'already_notified_after_lock';
+                    wati_release_lock($lock_key);
+                } else {
+                    if (send_wati_template($order->get_billing_phone(), $settings['conditions']['processing']['template_name'], $variables)) {
+                        update_option($notification_key, current_time('mysql'), false);
+                        $order_info['notification_sent'] = true;
+                        error_log('WATI Debug: Successfully sent processing notification for order ' . $order_id);
+                    } else {
+                        error_log('WATI Debug: Failed to send processing notification for order ' . $order_id);
+                    }
+                    wati_release_lock($lock_key);
                 }
-                wati_release_lock($lock_key);
             }
         }
 
@@ -3698,9 +3754,11 @@ function wati_terminate_notification_processes() {
         ON DUPLICATE KEY UPDATE option_value = NOW()
     ");
 
-    // Clear specific WATI-related options
-    $wpdb->query("DELETE FROM {$wpdb->options} WHERE option_name LIKE 'wati_processing_%'");
+    // Clear ONLY temporary processing state options, NOT notification tracking records
+    // These are temporary state indicators, not notification history
     $wpdb->query("DELETE FROM {$wpdb->options} WHERE option_name LIKE 'wati_batch_%'");
+    delete_option('wati_notification_processing');
+    delete_option('wati_processing_state');
     
     return true;
 }
@@ -3750,13 +3808,20 @@ function wati_process_orders_in_batches($order_ids, $callback, $batch_size = 50)
     // Check both emergency stop and stop signal at the start
     if (wati_check_emergency_stop() || wati_check_stop_signal()) {
         error_log('WATI Debug: Emergency stop/signal active - skipping batch processing');
-        wati_log_notification('emergency', '', '', 'warning', array(
-            'message' => 'Batch processing stopped due to emergency stop/signal',
-            'time' => current_time('mysql'),
-            'batch_size' => count($order_ids),
-            'process_id' => getmypid(),
-            'processing_state' => get_option('wati_processing_state', array())
-        ));
+        
+        // Throttle emergency logs to prevent spam (only log once every 5 minutes)
+        $emergency_log_key = 'wati_emergency_log_throttle';
+        $last_emergency_log = get_option($emergency_log_key, 0);
+        if (time() - $last_emergency_log > 300) { // 5 minutes
+            wati_log_notification('emergency', '', '', 'warning', array(
+                'message' => 'Batch processing stopped due to emergency stop/signal',
+                'time' => current_time('mysql'),
+                'batch_size' => count($order_ids),
+                'process_id' => getmypid(),
+                'processing_state' => get_option('wati_processing_state', array())
+            ));
+            update_option($emergency_log_key, time(), false);
+        }
         return;
     }
     
@@ -3778,15 +3843,21 @@ function wati_process_orders_in_batches($order_ids, $callback, $batch_size = 50)
         // Check emergency stop and stop signal before each batch
         if (wati_check_emergency_stop() || wati_check_stop_signal()) {
             error_log("WATI Debug: Emergency stop/signal activated during batch processing. Stopped at batch {$batch_index} of {$total_batches}");
-            wati_log_notification('emergency', '', '', 'warning', array(
-                'message' => 'Batch processing interrupted by emergency stop/signal',
-                'time' => current_time('mysql'),
-                'batch_index' => $batch_index,
-                'total_batches' => $total_batches,
-                'remaining_orders' => $total_orders - ($batch_index * $batch_size),
-                'process_id' => getmypid(),
-                'processing_state' => get_option('wati_processing_state', array())
-            ));
+            
+            // Throttle emergency logs during batch processing (only once per batch run)
+            static $batch_emergency_logged = false;
+            if (!$batch_emergency_logged) {
+                wati_log_notification('emergency', '', '', 'warning', array(
+                    'message' => 'Batch processing interrupted by emergency stop/signal',
+                    'time' => current_time('mysql'),
+                    'batch_index' => $batch_index,
+                    'total_batches' => $total_batches,
+                    'remaining_orders' => $total_orders - ($batch_index * $batch_size),
+                    'process_id' => getmypid(),
+                    'processing_state' => get_option('wati_processing_state', array())
+                ));
+                $batch_emergency_logged = true;
+            }
             return;
         }
         
@@ -3798,18 +3869,24 @@ function wati_process_orders_in_batches($order_ids, $callback, $batch_size = 50)
                 return;
             }
             
-            // Check emergency stop and stop signal before each order
+            // Check emergency stop and stop signal before each order (but don't spam logs)
             if (wati_check_emergency_stop() || wati_check_stop_signal()) {
                 error_log("WATI Debug: Emergency stop/signal activated during order processing. Stopped at order {$order_id}");
-                wati_log_notification('emergency', '', '', 'warning', array(
-                    'message' => 'Order processing interrupted by emergency stop/signal',
-                    'time' => current_time('mysql'),
-                    'order_id' => $order_id,
-                    'batch_index' => $batch_index,
-                    'total_batches' => $total_batches,
-                    'process_id' => getmypid(),
-                    'processing_state' => get_option('wati_processing_state', array())
-                ));
+                
+                // Throttle per-order emergency logs (only log once per order batch)
+                static $order_emergency_logged = false;
+                if (!$order_emergency_logged) {
+                    wati_log_notification('emergency', '', '', 'warning', array(
+                        'message' => 'Order processing interrupted by emergency stop/signal',
+                        'time' => current_time('mysql'),
+                        'order_id' => $order_id,
+                        'batch_index' => $batch_index,
+                        'total_batches' => $total_batches,
+                        'process_id' => getmypid(),
+                        'processing_state' => get_option('wati_processing_state', array())
+                    ));
+                    $order_emergency_logged = true;
+                }
                 return;
             }
             
@@ -3927,10 +4004,11 @@ function wati_kill_notification_processes() {
         }
     }
     
-    // Clear all WATI processing states
-    $wpdb->query("DELETE FROM {$wpdb->options} WHERE option_name LIKE 'wati_processing_%'");
+    // Clear ONLY temporary processing states, NOT notification tracking records
+    // These are temporary state indicators, not notification history
     $wpdb->query("DELETE FROM {$wpdb->options} WHERE option_name LIKE 'wati_batch_%'");
     delete_option('wati_notification_processing');
+    delete_option('wati_processing_state');
     
     return true;
 }
