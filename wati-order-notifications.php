@@ -2,7 +2,7 @@
 /*
 Plugin Name: WATI Order Notifications
 Description: Sends WhatsApp notifications for different order statuses using WATI API
-Version: 3.1.0
+Version: 4.0.0
 Author: Hamdy Mohammed
 */
 
@@ -94,6 +94,7 @@ function wati_notifications_settings_page_html() {
             wp_die('Invalid nonce');
         }
 
+        // Cutoff date removed – plugin now automatically restricts processing to current day only
         $settings = array(
             'bearer_token' => sanitize_text_field($_POST['wati_bearer_token']),
             'api_url' => sanitize_text_field($_POST['wati_api_url']),
@@ -101,8 +102,7 @@ function wati_notifications_settings_page_html() {
             'specific_users' => isset($_POST['wati_specific_users']) ? array_map('intval', $_POST['wati_specific_users']) : array(),
             'conditions' => array(),
             'cron_interval' => absint($_POST['wati_cron_interval']),
-            'cron_unit' => sanitize_text_field($_POST['wati_cron_unit']),
-            'cutoff_date' => sanitize_text_field($_POST['wati_cutoff_date'])
+            'cron_unit' => sanitize_text_field($_POST['wati_cron_unit'])
         );
 
         // Save conditions
@@ -224,7 +224,7 @@ function wati_notifications_settings_page_html() {
                 </div>
             </div>
 
-            <!-- General Settings -->
+            <!-- General Settings (Cutoff removed; restricted to current day automatically) -->
             <div class="card general-settings">
                 <div class="card-header">
                     <h2><span class="dashicons dashicons-admin-generic"></span> General Settings</h2>
@@ -232,21 +232,14 @@ function wati_notifications_settings_page_html() {
                 <div class="form-table">
                     <div class="form-field">
                         <label class="checkbox-label">
-                                <input type="checkbox" 
-                                       name="wati_enable_feature" 
-                                       value="1" 
-                                       <?php checked(isset($settings['enable_feature']) && $settings['enable_feature']); ?>>
+                            <input type="checkbox" 
+                                   name="wati_enable_feature" 
+                                   value="1" 
+                                   <?php checked(isset($settings['enable_feature']) && $settings['enable_feature']); ?>>
                             <span>Enable WATI WhatsApp notifications</span>
-                            </label>
-                            <p class="description">Turn this on to activate all notification features</p>
-                    </div>
-                    <div class="form-field">
-                        <label for="wati_cutoff_date">Cutoff Date</label>
-                        <input type="date" 
-                               name="wati_cutoff_date" 
-                               id="wati_cutoff_date" 
-                               value="<?php echo esc_attr($settings['cutoff_date'] ?? '2025-04-22'); ?>">
-                        <p class="description">Orders before this date will be ignored. Format: YYYY-MM-DD</p>
+                        </label>
+                        <p class="description">Turn this on to activate all notification features</p>
+                        <p class="description warning">Daily scope: Only orders/carts/tracking created today are processed. Each template + phone + order/cart combination is sent at most once per day.</p>
                     </div>
                 </div>
             </div>
@@ -1224,6 +1217,21 @@ function verify_wati_template_ajax() {
 
 // Update the send_wati_template function
 function send_wati_template($phone_number, $template_name, $variables = array()) {
+    // Enforce daily-only logic: ensure not already sent today for this template/phone/order/cart
+    $context_id = null; // derive from variables (order_number or cart id if provided)
+    if (!empty($variables)) {
+        foreach ($variables as $v) {
+            if (!empty($v['name']) && in_array($v['name'], array('order_number', 'cart_id', 'order_id'))) {
+                $context_id = $v['value'];
+                break;
+            }
+        }
+    }
+    $daily_key = wati_build_daily_dedupe_key($template_name, $phone_number, $context_id);
+    if (wati_daily_already_sent($daily_key)) {
+        error_log('WATI Debug: Daily dedupe prevented duplicate send (key: ' . $daily_key . ')');
+        return false;
+    }
     // First check if plugin is still active
     if (!wati_is_plugin_active()) {
         error_log('WATI Debug: Plugin is not active. Stopping message send to: ' . $phone_number);
@@ -1388,6 +1396,13 @@ function send_wati_template($phone_number, $template_name, $variables = array())
         // Set dedupe guard for 10 minutes
         set_transient($dedupe_key, 1, 10 * MINUTE_IN_SECONDS);
         error_log('WATI Debug: Message sent successfully');
+        // Record daily send to prevent duplicates same day
+        wati_record_daily_send($daily_key, array(
+            'template' => $template_name,
+            'phone' => $phone_number,
+            'context_id' => $context_id,
+            'time' => current_time('mysql')
+        ));
     } else {
         // Increment retry count on failure
         $retry_count++;
@@ -1598,6 +1613,63 @@ function wati_random_delay() {
     return wati_is_plugin_active();
 }
 
+// ================= Daily Scope & Dedupe Helpers =================
+/**
+ * Build a unique daily key for template+phone+context (order/cart).
+ */
+function wati_build_daily_dedupe_key($template, $phone, $context_id = null) {
+    $date = current_time('Y-m-d');
+    $base = strtolower(trim($template)) . '|' . preg_replace('/[^0-9]/', '', $phone) . '|' . ($context_id !== null ? $context_id : 'na');
+    return 'wati_daily_' . md5($date . '|' . $base);
+}
+
+/**
+ * Check if already sent today for this key.
+ */
+function wati_daily_already_sent($daily_key) {
+    $sent = get_option($daily_key, null);
+    if (!$sent) { return false; }
+    // Basic validation of date; if stale (different day) treat as not sent.
+    $today = current_time('Y-m-d');
+    if (isset($sent['time']) && substr($sent['time'],0,10) === $today) {
+        return true;
+    }
+    // Clean stale
+    delete_option($daily_key);
+    return false;
+}
+
+/**
+ * Record a daily send marker (non-autoload to avoid option table bloat in memory).
+ */
+function wati_record_daily_send($daily_key, $data) {
+    // Use add_option to avoid race; if exists just update.
+    if (!add_option($daily_key, $data, '', 'no')) {
+        update_option($daily_key, $data, 'no');
+    }
+}
+
+/**
+ * Clean yesterday's daily keys (run during daily log cleanup hook).
+ */
+function wati_cleanup_daily_keys() {
+    global $wpdb;
+    $today = current_time('Y-m-d');
+    // Delete any daily keys not matching today (simple LIKE then PHP filter if needed)
+    $like = $wpdb->esc_like('wati_daily_') . '%';
+    $options = $wpdb->get_results($wpdb->prepare("SELECT option_name, option_value FROM {$wpdb->options} WHERE option_name LIKE %s", $like));
+    if ($options) {
+        foreach ($options as $opt) {
+            $value = maybe_unserialize($opt->option_value);
+            if (!is_array($value) || empty($value['time']) || substr($value['time'],0,10) !== $today) {
+                delete_option($opt->option_name);
+            }
+        }
+    }
+}
+add_action('wati_cleanup_old_logs', 'wati_cleanup_daily_keys');
+
+
 // Check abandoned carts
 function check_abandoned_carts($settings, $is_test = false) {
     // Check if plugin is still active
@@ -1627,9 +1699,11 @@ function check_abandoned_carts($settings, $is_test = false) {
         $condition['delay_time'] * 60 : 
         $condition['delay_time'];
 
+    // Restrict to carts updated today only (daily scope)
     $sql = "SELECT * FROM {$wpdb->prefix}cartflows_ca_cart_abandonment 
             WHERE order_status = 'abandoned' 
             AND unsubscribed = 0
+            AND DATE(time) = CURDATE()
             AND time <= DATE_SUB(NOW(), INTERVAL %d MINUTE)";
 
     // Add user filter if specific users are selected
@@ -1707,6 +1781,15 @@ function check_abandoned_carts($settings, $is_test = false) {
             continue;
         }
 
+        // Daily dedupe check for this cart
+        $daily_key = wati_build_daily_dedupe_key($template_name, $phone, $cart->id);
+        if (wati_daily_already_sent($daily_key)) {
+            $cart_info['status'] = 'already_notified_today';
+            $details['already_notified']++;
+            $details['found_carts'][] = $cart_info;
+            continue;
+        }
+
         $cart_info['status'] = 'eligible';
         $cart_info['phone'] = $phone;
         $cart_info['customer_name'] = $other_fields['wcf_first_name'] ?? '';
@@ -1765,6 +1848,7 @@ function check_abandoned_carts($settings, $is_test = false) {
 
 // Check processing orders
 function check_processing_orders($settings, $is_test = false) {
+    // Daily scope now uses date_modified so orders created earlier but updated (status change) today are eligible
     global $wpdb;
     
     $details = array(
@@ -1777,10 +1861,12 @@ function check_processing_orders($settings, $is_test = false) {
     );
 
     // Get processing orders
+    // Use modified date for daily scope (order may become eligible when status changes today)
     $args = array(
         'status' => 'processing',
         'limit' => -1,
-        'return' => 'ids'
+        'return' => 'ids',
+        'date_modified' => current_time('Y-m-d') . '...' . current_time('Y-m-d')
     );
     
     $order_ids = wc_get_orders($args);
@@ -1867,6 +1953,16 @@ function check_processing_orders($settings, $is_test = false) {
         if (!$is_ready) {
             // Not ready to notify yet
             $order_info['status'] = 'waiting_delay';
+            $details['found_orders'][] = $order_info;
+            continue;
+        }
+
+        // Daily dedupe (template + phone + order id)
+        $template_name = $settings['conditions']['processing']['template_name'];
+        $daily_key = wati_build_daily_dedupe_key($template_name, $order->get_billing_phone(), $order_id);
+        if (wati_daily_already_sent($daily_key)) {
+            $order_info['status'] = 'already_notified_today';
+            $details['already_notified']++;
             $details['found_orders'][] = $order_info;
             continue;
         }
@@ -1959,6 +2055,7 @@ function check_processing_orders($settings, $is_test = false) {
 
 // Check shipped orders
 function check_shipped_orders($settings, $is_test = false) {
+    // Shipped/completed notifications use date_modified for daily scope to catch transitions occurring today
     global $wpdb;
     
     $details = array(
@@ -1978,11 +2075,13 @@ function check_shipped_orders($settings, $is_test = false) {
         $condition['delay_time'];
 
     // Get shipped and completed orders
+    // Use modified date so shipped/completed transitions today are considered even if created earlier
     $args = array(
         'status' => array('completed', 'shipped'),
         'limit' => -1,
         'return' => 'ids',
-        'type' => 'shop_order'
+        'type' => 'shop_order',
+        'date_modified' => current_time('Y-m-d') . '...' . current_time('Y-m-d')
     );
     
     $order_ids = wc_get_orders($args);
@@ -2046,6 +2145,16 @@ function check_shipped_orders($settings, $is_test = false) {
                 error_log("WATI Debug: Order {$order_id} has no phone number");
                 $order_info['status'] = 'no_phone';
                 $details['no_phone']++;
+                continue;
+            }
+
+            // Daily dedupe (template + phone + order id)
+            $template_name = $settings['conditions']['shipped']['template_name'];
+            $daily_key = wati_build_daily_dedupe_key($template_name, $order->get_billing_phone(), $order_id);
+            if (wati_daily_already_sent($daily_key)) {
+                $order_info['status'] = 'already_notified_today';
+                $details['already_notified']++;
+                $details['found_orders'][] = $order_info;
                 continue;
             }
 
@@ -3043,6 +3152,7 @@ function check_discount_notifications($settings, $is_test = false) {
     $sql = "SELECT ca.* FROM {$wpdb->prefix}cartflows_ca_cart_abandonment ca
             WHERE ca.order_status = 'abandoned' 
             AND ca.unsubscribed = 0
+            AND DATE(ca.time) = CURDATE()
             AND ca.time <= DATE_SUB(NOW(), INTERVAL %d MINUTE)
             AND EXISTS (
                 SELECT 1 FROM {$wpdb->prefix}options 
@@ -3162,6 +3272,20 @@ function check_discount_notifications($settings, $is_test = false) {
 
         error_log('WATI Debug: Sending discount template ' . $condition['template_name'] . ' with variables: ' . print_r($variables, true));
 
+        // Daily dedupe (template + phone + cart id)
+        $daily_key = wati_build_daily_dedupe_key($condition['template_name'], $phone, $cart->id);
+        if (wati_daily_already_sent($daily_key)) {
+            $details['already_notified'] = ($details['already_notified'] ?? 0) + 1;
+            $details['found_carts'][] = array(
+                'id' => $cart->id,
+                'email' => $cart->email,
+                'time' => $cart->time,
+                'cart_total' => $cart->cart_total,
+                'status' => 'already_notified_today'
+            );
+            continue;
+        }
+
         $details['eligible_carts']++;
         
     if (!$is_test) {
@@ -3209,7 +3333,8 @@ function check_discount_notifications($settings, $is_test = false) {
             'email' => $cart->email,
             'time' => $cart->time,
             'cart_total' => $cart->cart_total,
-            'status' => $details['status']
+            // Previously referenced undefined $details['status']; marking as processed
+            'status' => 'processed'
         );
     }
 
@@ -3294,13 +3419,13 @@ function check_custom_notifications($settings, $is_test = false) {
         $condition['delay_time'] * 60 : 
         $condition['delay_time'];
 
-    // Get all orders
+    // Get orders modified today only (daily scope for custom template)
     $args = array(
         'status' => array('any'),
         'limit' => -1,
-        'return' => 'ids'
+        'return' => 'ids',
+        'date_modified' => current_time('Y-m-d') . '...' . current_time('Y-m-d')
     );
-    
     $order_ids = wc_get_orders($args);
     $details['total_orders'] = count($order_ids);
 
@@ -3349,6 +3474,16 @@ function check_custom_notifications($settings, $is_test = false) {
             error_log("WATI Debug: Order {$order_id} has no phone number");
             $order_info['status'] = 'no_phone';
             $details['no_phone']++;
+            continue;
+        }
+
+        // Daily dedupe for custom template (template + phone + order)
+        $template_name = $settings['conditions']['custom']['template_name'];
+        $daily_key = wati_build_daily_dedupe_key($template_name, $order->get_billing_phone(), $order_id);
+        if (wati_daily_already_sent($daily_key)) {
+            $order_info['status'] = 'already_notified_today';
+            $details['already_notified']++;
+            $details['found_orders'][] = $order_info;
             continue;
         }
 
@@ -3422,6 +3557,7 @@ function check_custom_notifications($settings, $is_test = false) {
 
 // Check tracking notifications
 function check_tracking_notifications($settings, $is_test = false) {
+    // Tracking notifications use order modified date to pick up tracking numbers added today regardless of original creation date
     global $wpdb;
     
     error_log('WATI Debug: Starting tracking notifications check with detailed logging');
@@ -3460,10 +3596,18 @@ function check_tracking_notifications($settings, $is_test = false) {
         return $details;
     }
 
-    // Extract order IDs with valid tracking numbers
-    $order_ids = array_map(function($row) {
-        return $row['post_id'];
-    }, $tracking_numbers);
+    // Extract order IDs with valid tracking numbers and filter to orders modified today
+    $order_ids = array();
+    $today = current_time('Y-m-d');
+    foreach ($tracking_numbers as $row) {
+        $order = wc_get_order($row['post_id']);
+        if ($order) {
+            $modified = $order->get_date_modified();
+            if ($modified && $modified->date_i18n('Y-m-d') === $today) {
+                $order_ids[] = $row['post_id'];
+            }
+        }
+    }
 
     error_log('WATI Debug: Order IDs with tracking numbers: ' . print_r($order_ids, true));
 
@@ -3530,6 +3674,16 @@ function check_tracking_notifications($settings, $is_test = false) {
             error_log("WATI Debug: Order {$order_id} has no phone number");
             $order_info['status'] = 'no_phone';
             $details['no_phone']++;
+            continue;
+        }
+
+        // Daily dedupe (template + phone + order id)
+        $template_name = $settings['conditions']['tracking']['template_name'];
+        $daily_key = wati_build_daily_dedupe_key($template_name, $order->get_billing_phone(), $order_id);
+        if (wati_daily_already_sent($daily_key)) {
+            $order_info['status'] = 'already_notified_today';
+            $details['already_notified']++;
+            $details['found_orders'][] = $order_info;
             continue;
         }
 
@@ -3786,14 +3940,7 @@ function wati_check_stop_signal() {
 }
 
 function wati_check_order_date($order_date) {
-    $settings = get_option('wati_notifications_settings', array());
-    $cutoff_date = isset($settings['cutoff_date']) ? strtotime($settings['cutoff_date']) : strtotime('2025-04-22');
-    $order_timestamp = strtotime($order_date);
-    
-    if ($order_timestamp < $cutoff_date) {
-        error_log('WATI Debug: Order date ' . $order_date . ' is before cutoff date ' . date('Y-m-d', $cutoff_date));
-        return false;
-    }
+    // Cutoff removed: always true. Daily restriction handled in queries/filters.
     return true;
 }
 
