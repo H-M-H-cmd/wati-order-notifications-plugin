@@ -3557,20 +3557,24 @@ function check_custom_notifications($settings, $is_test = false) {
 
 // Check tracking notifications
 function check_tracking_notifications($settings, $is_test = false) {
-    // Tracking notifications use order modified date to pick up tracking numbers added today regardless of original creation date
+    // Tracking notifications: only orders whose MODIFIED date is today are considered (not creation date)
     global $wpdb;
-    
+
     error_log('WATI Debug: Starting tracking notifications check with detailed logging');
     error_log('WATI Debug: Settings for tracking: ' . print_r($settings['conditions']['tracking'], true));
-    
+
     $details = array(
         'condition' => $settings['conditions']['tracking'],
         'found_orders' => array(),
+        // total_orders = orders with tracking number WHERE modified today
         'total_orders' => 0,
         'eligible_orders' => 0,
         'already_notified' => 0,
         'no_phone' => 0,
-        'old_orders' => 0
+        'old_orders' => 0,
+        // diagnostic counters
+    'skipped_not_modified_today' => 0,
+    'skipped_status_excluded' => 0
     );
 
     // Verify tracking notifications are enabled
@@ -3596,22 +3600,26 @@ function check_tracking_notifications($settings, $is_test = false) {
         return $details;
     }
 
-    // Extract order IDs with valid tracking numbers and filter to orders modified today
-    $order_ids = array();
+    // Extract order IDs with valid tracking numbers. We'll separate those modified today vs not.
     $today = current_time('Y-m-d');
+    $order_ids = array();
+    $not_modified_today = array();
     foreach ($tracking_numbers as $row) {
         $order = wc_get_order($row['post_id']);
-        if ($order) {
-            $modified = $order->get_date_modified();
-            if ($modified && $modified->date_i18n('Y-m-d') === $today) {
-                $order_ids[] = $row['post_id'];
-            }
+        if (!$order) { continue; }
+        $modified = $order->get_date_modified();
+        if ($modified && $modified->date_i18n('Y-m-d') === $today) {
+            $order_ids[] = $row['post_id'];
+        } else {
+            $not_modified_today[] = $row['post_id'];
         }
     }
 
-    error_log('WATI Debug: Order IDs with tracking numbers: ' . print_r($order_ids, true));
+    $details['skipped_not_modified_today'] = count($not_modified_today);
+    error_log('WATI Debug: Tracking numbers - modified today: ' . print_r($order_ids, true));
+    error_log('WATI Debug: Tracking numbers - NOT modified today (ignored): ' . print_r($not_modified_today, true));
 
-    $details['total_orders'] = count($order_ids);
+    $details['total_orders'] = count($order_ids); // only counting those eligible for today scope
 
     // Add user filter
     if (!empty($settings['specific_users'])) {
@@ -3627,10 +3635,21 @@ function check_tracking_notifications($settings, $is_test = false) {
         error_log('WATI Debug: After user filtering, remaining orders: ' . count($order_ids));
     }
 
+    // Define statuses to exclude from tracking messages
+    $excluded_statuses = apply_filters('wati_tracking_excluded_statuses', array('cancelled', 'refunded', 'failed', 'trash'));
+    error_log('WATI Debug: Tracking excluded statuses: ' . implode(',', $excluded_statuses));
+
     foreach ($order_ids as $order_id) {
         $order = wc_get_order($order_id);
         if (!$order) {
             error_log("WATI Debug: Could not load order {$order_id}");
+            continue;
+        }
+
+        // Exclude certain statuses (e.g., cancelled orders should not get tracking)
+        if (in_array($order->get_status(), $excluded_statuses, true)) {
+            error_log("WATI Debug: Order {$order_id} skipped due to excluded status: " . $order->get_status());
+            $details['skipped_status_excluded']++;
             continue;
         }
 
@@ -3651,7 +3670,9 @@ function check_tracking_notifications($settings, $is_test = false) {
 
         $order_info = array(
             'id' => $order_id,
-            'date' => $order->get_date_created()->format('Y-m-d H:i:s'),
+            // Provide both created and modified for clarity in UI/testing
+            'created_date' => $order->get_date_created() ? $order->get_date_created()->format('Y-m-d H:i:s') : '',
+            'modified_date' => $order->get_date_modified() ? $order->get_date_modified()->date_i18n('Y-m-d H:i:s') : '',
             'total' => $order->get_total(),
             'customer' => $order->get_billing_first_name() . ' ' . $order->get_billing_last_name(),
             'phone' => $order->get_billing_phone(),
